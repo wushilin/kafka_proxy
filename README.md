@@ -1,6 +1,8 @@
 # Kafka SNI Proxy
 
 SNI-based Kafka TLS proxy that:
+- Is high-performance and lightweight for production traffic.
+- Uses a zero-copy streaming path for non-rewritten Kafka responses.
 - Terminates TLS from clients.
 - Connects to upstream brokers over TLS.
 - Rewrites broker host/port in selected Kafka responses so clients reconnect through the proxy.
@@ -8,6 +10,9 @@ SNI-based Kafka TLS proxy that:
 
 ## Features
 
+- High-performance, low-overhead forwarding for Kafka traffic.
+- Zero-copy passthrough for response types that do not require rewrite.
+- Lightweight runtime profile (minimal allocations on hot path).
 - Client-side TLS termination (`server.pem`/`key.pem`).
 - Optional mTLS for clients (`--mtls-enable`, `--ca-certs`).
 - Upstream TLS with verification by:
