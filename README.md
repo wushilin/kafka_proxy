@@ -1,4 +1,7 @@
 # Kafka SNI Proxy
+Use this if your backend is Confluent Cloud. it is super easy to setup, battery included. Scales to gigabits per second with only less than 10% CPU utilization on one core.
+
+# Highlights
 
 SNI-based Kafka TLS proxy that:
 - Is high-performance and lightweight for production traffic.
