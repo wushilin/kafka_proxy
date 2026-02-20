@@ -15,6 +15,8 @@ use crate::rewrite::BrokerMappingRule;
 use crate::stats::ProxyStats;
 use crate::upstream::{build_upstream_map, build_upstream_tls_connector};
 use anyhow::{anyhow, Context, Result};
+use rustls::pki_types::CertificateDer;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_rustls::rustls;
@@ -52,7 +54,7 @@ pub async fn run(args: Args) -> Result<()> {
     info!("mTLS: {}", if mtls_enabled { "enabled" } else { "disabled" });
     info!("Upstream brokers: {:?}", args.upstream);
 
-    let certs = load_certs(&args.cert)?;
+    let certs = server_cert_chain_for_handshake(&args.cert, args.ca_certs.as_deref())?;
     let key = load_private_key(&args.key)?;
 
     let mut server_config = rustls::ServerConfig::builder()
@@ -77,7 +79,7 @@ pub async fn run(args: Args) -> Result<()> {
             .build()
             .context("Failed to build client certificate verifier")?;
 
-        let certs = load_certs(&args.cert)?;
+        let certs = server_cert_chain_for_handshake(&args.cert, args.ca_certs.as_deref())?;
         let key = load_private_key(&args.key)?;
 
         server_config = rustls::ServerConfig::builder()
@@ -173,4 +175,49 @@ pub async fn run(args: Args) -> Result<()> {
         stats,
     )
     .await
+}
+
+fn server_cert_chain_for_handshake(
+    cert_path: &str,
+    ca_cert_hint: Option<&str>,
+) -> Result<Vec<CertificateDer<'static>>> {
+    let mut certs = load_certs(cert_path)?;
+    if certs.is_empty() {
+        return Ok(certs);
+    }
+
+    let mut appended = 0usize;
+    if certs.len() == 1 {
+        let mut ca_candidates: Vec<PathBuf> = Vec::new();
+        if let Some(hint) = ca_cert_hint {
+            ca_candidates.push(PathBuf::from(hint));
+        }
+        if let Some(parent) = Path::new(cert_path).parent() {
+            ca_candidates.push(parent.join("ca.pem"));
+        }
+        ca_candidates.push(PathBuf::from("ca.pem"));
+
+        for candidate in ca_candidates {
+            if let Ok(extra) = load_certs(candidate.to_string_lossy().as_ref()) {
+                for cert in extra {
+                    if !certs.iter().any(|existing| existing.as_ref() == cert.as_ref()) {
+                        certs.push(cert);
+                        appended += 1;
+                    }
+                }
+                if appended > 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    info!(
+        "TLS certificate chain loaded from {} with {} cert(s) ({} appended)",
+        cert_path,
+        certs.len(),
+        appended
+    );
+
+    Ok(certs)
 }

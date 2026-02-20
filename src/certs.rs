@@ -28,7 +28,18 @@ pub fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
 }
 
 pub fn generate_default_certs(sni_suffix: &str) -> Result<()> {
-    let not_before = OffsetDateTime::now_utc();
+    for path in ["ca.pem", "server.pem", "key.pem"] {
+        if std::path::Path::new(path).exists() {
+            return Err(anyhow!(
+                "Refusing to overwrite existing file: {}. Remove it first or move it aside.",
+                path
+            ));
+        }
+    }
+
+    let not_before = OffsetDateTime::now_utc()
+        .checked_sub(Duration::days(1))
+        .ok_or_else(|| anyhow!("Failed to compute certificate not_before"))?;
     let not_after = not_before
         .checked_add(Duration::days(365 * 20))
         .ok_or_else(|| anyhow!("Failed to compute certificate validity period"))?;
@@ -69,8 +80,11 @@ pub fn generate_default_certs(sni_suffix: &str) -> Result<()> {
         .signed_by(&server_key, &ca_cert, &ca_key)
         .context("Failed to sign server certificate")?;
 
-    fs::write("ca.pem", ca_cert.pem()).context("Failed to write ca.pem")?;
-    fs::write("server.pem", server_cert.pem()).context("Failed to write server.pem")?;
+    let ca_pem = ca_cert.pem();
+    let server_pem = server_cert.pem();
+
+    fs::write("ca.pem", ca_pem).context("Failed to write ca.pem")?;
+    fs::write("server.pem", server_pem).context("Failed to write server.pem")?;
     fs::write("key.pem", server_key.serialize_pem()).context("Failed to write key.pem")?;
 
     Ok(())
