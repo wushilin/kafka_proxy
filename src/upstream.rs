@@ -1,5 +1,5 @@
 use crate::certs::load_certs;
-use crate::cli::Args;
+use crate::config::FileConfig;
 use anyhow::{anyhow, Context, Result};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName};
@@ -62,7 +62,7 @@ impl ServerCertVerifier for TrustAllUpstreamCertVerifier {
 pub fn build_upstream_map(upstreams: &[String]) -> Result<HashMap<String, String>> {
     if upstreams.is_empty() {
         return Err(anyhow!(
-            "At least one --upstream is required (example: b1.upstream.com:9092)"
+            "At least one upstream bootstrap server is required (example: b1.upstream.com:9092)"
         ));
     }
 
@@ -107,8 +107,25 @@ pub fn upstream_host(upstream_addr: &str) -> Result<&str> {
     Ok(host)
 }
 
-pub fn build_upstream_tls_connector(args: &Args) -> Result<TlsConnector> {
-    let client_config = if args.trust_upstream_certs {
+pub fn build_upstream_tls_connector(
+    file_config: &FileConfig,
+    tls_enabled: bool,
+) -> Result<Option<TlsConnector>> {
+    if !tls_enabled {
+        return Ok(None);
+    }
+
+    let cfg_tls = file_config
+        .upstream
+        .as_ref()
+        .and_then(|up| up.tls.as_ref());
+
+    let trust_upstream_certs = cfg_tls
+        .and_then(|tls| tls.trust_server_certs)
+        .unwrap_or(false);
+    let upstream_ca_certs = cfg_tls.and_then(|tls| tls.ca_certs.as_deref());
+
+    let client_config = if trust_upstream_certs {
         info!("Upstream TLS verification disabled by --trust-upstream-certs");
         rustls::ClientConfig::builder()
             .dangerous()
@@ -117,7 +134,7 @@ pub fn build_upstream_tls_connector(args: &Args) -> Result<TlsConnector> {
     } else {
         let mut root_store = rustls::RootCertStore::empty();
 
-        if let Some(path) = &args.upstream_ca_certs {
+        if let Some(path) = upstream_ca_certs {
             info!("Using upstream CA bundle from {}", path);
             for cert in load_certs(path)? {
                 root_store
@@ -146,5 +163,5 @@ pub fn build_upstream_tls_connector(args: &Args) -> Result<TlsConnector> {
             .with_no_client_auth()
     };
 
-    Ok(TlsConnector::from(Arc::new(client_config)))
+    Ok(Some(TlsConnector::from(Arc::new(client_config))))
 }

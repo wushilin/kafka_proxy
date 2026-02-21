@@ -2,6 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use std::fs;
 use std::net::IpAddr;
 
+use crate::config::ResolveEntry;
+
 #[derive(Debug, Clone)]
 struct HostRule {
     ip: IpAddr,
@@ -27,6 +29,7 @@ pub struct HostsResolver {
 }
 
 impl HostsResolver {
+    #[allow(dead_code)]
     pub fn from_file(path: &str) -> Result<Self> {
         let content = fs::read_to_string(path)
             .with_context(|| format!("Failed to read hosts file '{}'", path))?;
@@ -93,6 +96,58 @@ impl HostsResolver {
         }
 
         best.map(|r| r.ip)
+    }
+
+    pub fn from_entries(entries: &[ResolveEntry]) -> Result<Self> {
+        let mut rules = Vec::new();
+        let mut order = 0usize;
+
+        for (idx, entry) in entries.iter().enumerate() {
+            let mut any = false;
+            if let Some(v4) = &entry.ipv4 {
+                let ip: IpAddr = v4.parse().with_context(|| {
+                    format!("Invalid ipv4 '{}' in resolve entry {}", v4, idx + 1)
+                })?;
+                let is_wildcard = entry.host.contains('*');
+                let wildcard_weight = entry.host.chars().filter(|c| *c != '*').count();
+                rules.push(HostRule {
+                    ip,
+                    pattern: entry.host.clone(),
+                    is_wildcard,
+                    wildcard_weight,
+                    order,
+                });
+                order += 1;
+                any = true;
+            }
+
+            if let Some(v6) = &entry.ipv6 {
+                let ip: IpAddr = v6.parse().with_context(|| {
+                    format!("Invalid ipv6 '{}' in resolve entry {}", v6, idx + 1)
+                })?;
+                let is_wildcard = entry.host.contains('*');
+                let wildcard_weight = entry.host.chars().filter(|c| *c != '*').count();
+                rules.push(HostRule {
+                    ip,
+                    pattern: entry.host.clone(),
+                    is_wildcard,
+                    wildcard_weight,
+                    order,
+                });
+                order += 1;
+                any = true;
+            }
+
+            if !any {
+                return Err(anyhow!(
+                    "Invalid resolve entry {} for host '{}': expected ipv4 or ipv6",
+                    idx + 1,
+                    entry.host
+                ));
+            }
+        }
+
+        Ok(Self { rules })
     }
 }
 

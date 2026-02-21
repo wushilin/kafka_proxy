@@ -1,0 +1,55 @@
+bind_address: 0.0.0.0
+upstream:
+  bootstrap_servers:
+    - pkc-312o0.ap-southeast-1.aws.confluent.cloud:9092
+  security_protocol: SASL_SSL
+  sasl_mechanism: PLAIN
+  tls:
+    enabled: true
+    #ca_certs: /path/to/ca.pem
+    #client_cert: /path/to/client.pem
+    #client_key: /path/to/client.key
+    trust_server_certs: true
+downstream:
+  security_protocol: SASL_SSL
+  sasl_mechanism: SCRAM-SHA-512
+  tls:
+    enabled: true
+    mtls_enabled: true
+    ca_certs: ca.pem
+    cert: server.pem
+    key: key.pem
+broker_mapping:
+  mode: sni
+  sni:
+    bind_port: 9092
+    upstream: "(.*).ap-southeast1.(.*).confluent.cloud"
+    downstream: "local-<$1>.beatbox.com" #supports <$1> <$2> for capture groups, and <$id> for broker ids
+  # mode: port_offset
+  # port_offset:
+  #   hostname: "mybroker.loca.com"
+  #   base: 9093 # advertised port is base + broker_id
+  # mode: static
+  # static:
+  #   - upstream: "broker1:9093"
+  #     downstream: "local-broker1:9093"
+
+auth_swap:
+  enabled: true
+  downstream_credentials: # when not defined, do not require authentication from client
+    - "key1=value1"
+    - "key2=value2"
+    - "key3=value3"
+  upstream_credentials:
+    - "keyA=valueA"
+    - "keyB=valueB"
+    - "keyC=valueC"
+  mapping:
+    - "key1=keyA"
+    - "key2=keyB"
+    - "key3=keyC"
+resolve:
+  - host: "abc.com"
+    ipv4: "127.0.0.1"
+  - host: "*.def.com"
+    ipv6: "2001:db8::1"

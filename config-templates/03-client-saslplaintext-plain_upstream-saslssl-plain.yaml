@@ -1,0 +1,31 @@
+bind_address: "0.0.0.0"
+
+upstream:
+  bootstrap_servers:
+    - "pkc-312o0.ap-southeast-1.aws.confluent.cloud:9092"
+  security_protocol: "SASL_SSL"
+  sasl_mechanism: "PLAIN"
+  tls:
+    ca_certs: "server_ca.pem"
+    trust_server_certs: false
+
+downstream:
+  security_protocol: "SASL_PLAINTEXT"
+  sasl_mechanism: "PLAIN"
+
+broker_mapping:
+  mode: "port_offset"
+  port_offset:
+    hostname: "broker.beatbox.com"
+    base: 9092
+
+auth_swap:
+  enabled: true
+  downstream_credentials:
+    - "app1=plainsecret"
+  upstream_credentials:
+    - "${APIK1}=${APIS1}" # supports env vars for secrets
+  mapping:
+    - "app1=${APIK1}"
+
+resolve: []

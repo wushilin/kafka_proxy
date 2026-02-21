@@ -6,13 +6,90 @@ use kafka_protocol::messages::{
 };
 use kafka_protocol::protocol::{Decodable, Encodable, Message};
 use regex::Regex;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
-fn rewrite_advertised_host(node_id: i32, sni_suffix: &str) -> String {
-    format!("b{}.{}", node_id, sni_suffix)
+#[derive(Debug, Clone)]
+pub enum BrokerAdvertiseMode {
+    Sni {
+        bind_port: u16,
+        mapping_rule: Option<BrokerMappingRule>,
+        state: Arc<Mutex<HashMap<i32, (String, i32)>>>,
+    },
+    PortOffset {
+        hostname: String,
+        base_port: u16,
+        bootstrap_reserved: u16,
+        bootstrap_count: u16,
+        max_broker_id: u16,
+        state: Arc<Mutex<PortOffsetState>>,
+    },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
+pub struct PortOffsetState {
+    id_to_endpoint: HashMap<i32, (String, i32)>,
+}
+
+impl PortOffsetState {
+    fn update_ids(
+        &mut self,
+        ids: &[i32],
+        hostname: &str,
+        base_port: u16,
+        bootstrap_reserved: u16,
+        max_broker_id: u16,
+        replace_existing: bool,
+        log_ctx: &str,
+    ) -> Result<()> {
+        let mut pending = Vec::with_capacity(ids.len());
+        for id in ids {
+            if *id < 0 {
+                return Err(anyhow::anyhow!(
+                    "{} port_offset mapping error: negative broker id {} is not supported",
+                    log_ctx,
+                    id
+                ));
+            }
+            let id_u16 = u16::try_from(*id).unwrap_or(u16::MAX);
+            if id_u16 > max_broker_id {
+                return Err(anyhow::anyhow!(
+                    "{} port_offset mapping error: broker id {} exceeds configured max_broker_id {}",
+                    log_ctx,
+                    id,
+                    max_broker_id
+                ));
+            }
+            let port = (base_port as i32) + (bootstrap_reserved as i32) + (*id);
+            if !(1..=65535).contains(&port) {
+                return Err(anyhow::anyhow!(
+                    "{} port_offset mapping error: computed port {} out of valid range for broker id {}",
+                    log_ctx,
+                    port,
+                    id
+                ));
+            }
+            pending.push((*id, port));
+        }
+
+        for (id, port) in pending {
+            self.id_to_endpoint
+                .insert(id, (hostname.to_string(), port));
+        }
+        if replace_existing {
+            let keep: HashSet<i32> = ids.iter().copied().collect();
+            self.id_to_endpoint.retain(|id, _| keep.contains(id));
+        }
+        Ok(())
+    }
+
+    fn endpoint_for(&self, broker_id: i32) -> Option<(String, i32)> {
+        self.id_to_endpoint.get(&broker_id).cloned()
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct BrokerMappingRule {
     regex: Regex,
     replacement: String,
@@ -31,17 +108,49 @@ impl BrokerMappingRule {
         })
     }
 
-    fn map_host(&self, upstream_host: &str) -> Option<String> {
-        if self.regex.is_match(upstream_host) {
-            Some(
-                self.regex
-                    .replace(upstream_host, self.replacement.as_str())
-                    .into_owned(),
-            )
-        } else {
-            None
-        }
+    fn map_host(&self, upstream_host: &str, broker_id: i32) -> Option<String> {
+        let captures = self.regex.captures(upstream_host)?;
+        Some(render_mapping_template(
+            self.replacement.as_str(),
+            &captures,
+            broker_id,
+        ))
     }
+}
+
+fn render_mapping_template(
+    template: &str,
+    captures: &regex::Captures<'_>,
+    broker_id: i32,
+) -> String {
+    let mut out = String::with_capacity(template.len() + 16);
+    let mut i = 0usize;
+    while i < template.len() {
+        let rem = &template[i..];
+        if rem.starts_with("<$") {
+            if let Some(end_rel) = rem.find('>') {
+                let token = &rem[2..end_rel];
+                if token == "id" {
+                    out.push_str(&broker_id.to_string());
+                } else if let Ok(group_idx) = token.parse::<usize>() {
+                    if let Some(m) = captures.get(group_idx) {
+                        out.push_str(m.as_str());
+                    }
+                } else {
+                    out.push_str("<$");
+                    out.push_str(token);
+                    out.push('>');
+                }
+                i += end_rel + 1;
+                continue;
+            }
+        }
+
+        let ch = rem.chars().next().unwrap_or_default();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn supports_rewrite_version(api_key: ApiKey, api_version: i16) -> bool {
@@ -66,15 +175,94 @@ fn supports_rewrite_version(api_key: ApiKey, api_version: i16) -> bool {
 pub struct RewriteOutcome {
     pub payload: Option<Bytes>,
     pub discovered_routes: Vec<(String, String)>,
+    pub topology_snapshot_ids: Option<Vec<i32>>,
+}
+
+fn advertised_target(
+    mode: &BrokerAdvertiseMode,
+    node_id: i32,
+    upstream_host: &str,
+    log_ctx: &str,
+) -> Result<(String, i32, Option<String>)> {
+    match mode {
+        BrokerAdvertiseMode::Sni {
+            bind_port,
+            mapping_rule,
+            state,
+        } => {
+            let computed_host = mapping_rule
+                .as_ref()
+                .and_then(|rule| rule.map_host(upstream_host, node_id))
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No SNI downstream host mapping available for broker {} from broker_mapping.sni rule",
+                        node_id
+                    )
+                })?;
+            let computed_port = *bind_port as i32;
+            let mut guard = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("sni mapping state lock poisoned"))?;
+            if let Some((host, port)) = guard.get(&node_id).cloned() {
+                if host != computed_host || port != computed_port {
+                    panic!(
+                        "{} fatal broker mapping inconsistency: broker {} was mapped to {}:{}, now wants {}:{}",
+                        log_ctx, node_id, host, port, computed_host, computed_port
+                    );
+                }
+                Ok((host.clone(), port, Some(host)))
+            } else {
+                assert_unique_mapping(&guard, node_id, &computed_host, computed_port, log_ctx);
+                guard.insert(node_id, (computed_host.clone(), computed_port));
+                Ok((computed_host.clone(), computed_port, Some(computed_host)))
+            }
+        }
+        BrokerAdvertiseMode::PortOffset {
+            hostname,
+            base_port,
+            bootstrap_reserved,
+            max_broker_id,
+            state,
+            ..
+        } => {
+            let guard = state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("port_offset state lock poisoned"))?;
+            let (host, port) = guard
+                .endpoint_for(node_id)
+                .ok_or_else(|| anyhow::anyhow!("No endpoint assigned for broker id {}", node_id))?;
+            let id_u16 = u16::try_from(node_id).unwrap_or(u16::MAX);
+            if id_u16 > *max_broker_id {
+                return Err(anyhow::anyhow!(
+                    "{} port_offset mapping error: broker id {} exceeds configured max_broker_id {}",
+                    log_ctx,
+                    node_id,
+                    max_broker_id
+                ));
+            }
+            if !(1..=65535).contains(&port) {
+                return Err(anyhow::anyhow!(
+                    "Invalid advertised port {} computed for node_id {} in port_offset mode",
+                    port,
+                    node_id
+                ));
+            }
+            if host != *hostname || port < (*base_port as i32 + *bootstrap_reserved as i32) {
+                panic!(
+                    "{} fatal port_offset mapping corruption for broker {} -> {}:{}",
+                    log_ctx, node_id, host, port
+                );
+            }
+            Ok((host.clone(), port, Some(format!("{}:{}", host, port))))
+        }
+    }
 }
 
 pub fn maybe_rewrite_kafka_response(
     payload: &[u8],
     api_key: ApiKey,
     api_version: i16,
-    sni_suffix: &str,
-    bind_port: u16,
-    mapping_rule: Option<&BrokerMappingRule>,
+    advertise_mode: &BrokerAdvertiseMode,
     log_ctx: &str,
 ) -> Result<RewriteOutcome> {
     if !matches!(
@@ -84,6 +272,7 @@ pub fn maybe_rewrite_kafka_response(
         return Ok(RewriteOutcome {
             payload: None,
             discovered_routes: Vec::new(),
+            topology_snapshot_ids: None,
         });
     }
 
@@ -95,6 +284,7 @@ pub fn maybe_rewrite_kafka_response(
         return Ok(RewriteOutcome {
             payload: None,
             discovered_routes: Vec::new(),
+            topology_snapshot_ids: None,
         });
     }
 
@@ -116,60 +306,101 @@ pub fn maybe_rewrite_kafka_response(
 
     let mut rewritten_any = false;
     let mut discovered_routes = Vec::new();
-    let target_host = |node_id: i32, upstream_host: &str| {
-        mapping_rule
-            .and_then(|rule| rule.map_host(upstream_host))
-            .unwrap_or_else(|| rewrite_advertised_host(node_id, sni_suffix))
-    };
-
+    let mut topology_snapshot_ids: Option<Vec<i32>> = None;
+    let mut seen_downstream_endpoints: HashMap<(String, i32), i32> = HashMap::new();
     match &mut response {
         ResponseKind::Metadata(metadata) => {
+            let ids: Vec<i32> = metadata.brokers.iter().map(|b| b.node_id.0).collect();
+            update_port_offset_assignments(advertise_mode, &ids, true, log_ctx)?;
+            topology_snapshot_ids = Some(ids.clone());
             for broker in &mut metadata.brokers {
                 let original_host = broker.host.as_str().to_string();
                 let node_id = broker.node_id.0;
                 let original_port = broker.port;
-                let rewritten_host = target_host(node_id, &original_host);
+                let (rewritten_host, rewritten_port, route_key) =
+                    advertised_target(advertise_mode, node_id, &original_host, log_ctx)?;
+                assert_unique_downstream_endpoint(
+                    &mut seen_downstream_endpoints,
+                    node_id,
+                    &rewritten_host,
+                    rewritten_port,
+                    log_ctx,
+                );
                 let upstream_addr = format!("{}:{}", original_host, original_port);
                 discovered_routes.push((format!("b{}", node_id), upstream_addr.clone()));
-                discovered_routes.push((rewritten_host.clone(), upstream_addr));
+                if let Some(key) = route_key {
+                    discovered_routes.push((key, upstream_addr));
+                }
                 broker.host = rewritten_host.clone().into();
-                broker.port = bind_port as i32;
+                broker.port = rewritten_port;
                 rewritten_any = true;
 
                 info!(
                     "{} rewrote Metadata broker node_id={} host='{}' -> '{}' port={}",
-                    log_ctx, node_id, original_host, rewritten_host, bind_port
+                    log_ctx, node_id, original_host, rewritten_host, rewritten_port
                 );
             }
         }
         ResponseKind::FindCoordinator(find_coordinator) => {
             if api_version <= 3 {
+                update_port_offset_assignments(
+                    advertise_mode,
+                    &[find_coordinator.node_id.0],
+                    false,
+                    log_ctx,
+                )?;
                 let original_host = find_coordinator.host.as_str().to_string();
                 let node_id = find_coordinator.node_id.0;
                 let original_port = find_coordinator.port;
-                let rewritten_host = target_host(node_id, &original_host);
+                let (rewritten_host, rewritten_port, route_key) =
+                    advertised_target(advertise_mode, node_id, &original_host, log_ctx)?;
+                assert_unique_downstream_endpoint(
+                    &mut seen_downstream_endpoints,
+                    node_id,
+                    &rewritten_host,
+                    rewritten_port,
+                    log_ctx,
+                );
                 let upstream_addr = format!("{}:{}", original_host, original_port);
                 discovered_routes.push((format!("b{}", node_id), upstream_addr.clone()));
-                discovered_routes.push((rewritten_host.clone(), upstream_addr));
+                if let Some(key) = route_key {
+                    discovered_routes.push((key, upstream_addr));
+                }
                 find_coordinator.host = rewritten_host.clone().into();
-                find_coordinator.port = bind_port as i32;
+                find_coordinator.port = rewritten_port;
                 rewritten_any = true;
 
                 info!(
                     "{} rewrote FindCoordinator node_id={} host='{}' -> '{}' port={}",
-                    log_ctx, node_id, original_host, rewritten_host, bind_port
+                    log_ctx, node_id, original_host, rewritten_host, rewritten_port
                 );
             } else {
+                let ids: Vec<i32> = find_coordinator
+                    .coordinators
+                    .iter()
+                    .map(|c| c.node_id.0)
+                    .collect();
+                update_port_offset_assignments(advertise_mode, &ids, false, log_ctx)?;
                 for coordinator in &mut find_coordinator.coordinators {
                     let original_host = coordinator.host.as_str().to_string();
                     let node_id = coordinator.node_id.0;
                     let original_port = coordinator.port;
-                    let rewritten_host = target_host(node_id, &original_host);
+                    let (rewritten_host, rewritten_port, route_key) =
+                        advertised_target(advertise_mode, node_id, &original_host, log_ctx)?;
+                    assert_unique_downstream_endpoint(
+                        &mut seen_downstream_endpoints,
+                        node_id,
+                        &rewritten_host,
+                        rewritten_port,
+                        log_ctx,
+                    );
                     let upstream_addr = format!("{}:{}", original_host, original_port);
                     discovered_routes.push((format!("b{}", node_id), upstream_addr.clone()));
-                    discovered_routes.push((rewritten_host.clone(), upstream_addr));
+                    if let Some(key) = route_key {
+                        discovered_routes.push((key, upstream_addr));
+                    }
                     coordinator.host = rewritten_host.clone().into();
-                    coordinator.port = bind_port as i32;
+                    coordinator.port = rewritten_port;
                     rewritten_any = true;
 
                     info!(
@@ -179,27 +410,40 @@ pub fn maybe_rewrite_kafka_response(
                         node_id,
                         original_host,
                         rewritten_host,
-                        bind_port
+                        rewritten_port
                     );
                 }
             }
         }
         ResponseKind::DescribeCluster(describe_cluster) => {
+            let ids: Vec<i32> = describe_cluster.brokers.iter().map(|b| b.broker_id.0).collect();
+            update_port_offset_assignments(advertise_mode, &ids, true, log_ctx)?;
+            topology_snapshot_ids = Some(ids.clone());
             for broker in &mut describe_cluster.brokers {
                 let original_host = broker.host.as_str().to_string();
                 let broker_id = broker.broker_id.0;
                 let original_port = broker.port;
-                let rewritten_host = target_host(broker_id, &original_host);
+                let (rewritten_host, rewritten_port, route_key) =
+                    advertised_target(advertise_mode, broker_id, &original_host, log_ctx)?;
+                assert_unique_downstream_endpoint(
+                    &mut seen_downstream_endpoints,
+                    broker_id,
+                    &rewritten_host,
+                    rewritten_port,
+                    log_ctx,
+                );
                 let upstream_addr = format!("{}:{}", original_host, original_port);
                 discovered_routes.push((format!("b{}", broker_id), upstream_addr.clone()));
-                discovered_routes.push((rewritten_host.clone(), upstream_addr));
+                if let Some(key) = route_key {
+                    discovered_routes.push((key, upstream_addr));
+                }
                 broker.host = rewritten_host.clone().into();
-                broker.port = bind_port as i32;
+                broker.port = rewritten_port;
                 rewritten_any = true;
 
                 info!(
                     "{} rewrote DescribeCluster broker_id={} host='{}' -> '{}' port={}",
-                    log_ctx, broker_id, original_host, rewritten_host, bind_port
+                    log_ctx, broker_id, original_host, rewritten_host, rewritten_port
                 );
             }
         }
@@ -210,6 +454,7 @@ pub fn maybe_rewrite_kafka_response(
         return Ok(RewriteOutcome {
             payload: None,
             discovered_routes,
+            topology_snapshot_ids,
         });
     }
 
@@ -224,5 +469,81 @@ pub fn maybe_rewrite_kafka_response(
     Ok(RewriteOutcome {
         payload: Some(encoded.freeze()),
         discovered_routes,
+        topology_snapshot_ids,
     })
+}
+
+fn assert_unique_downstream_endpoint(
+    seen: &mut HashMap<(String, i32), i32>,
+    broker_id: i32,
+    host: &str,
+    port: i32,
+    log_ctx: &str,
+) {
+    let key = (host.to_string(), port);
+    if let Some(existing) = seen.insert(key.clone(), broker_id) {
+        if existing != broker_id {
+            panic!(
+                "{} fatal broker mapping collision: brokers {} and {} both mapped to downstream {}:{}",
+                log_ctx, existing, broker_id, key.0, key.1
+            );
+        }
+    }
+}
+
+fn assert_unique_mapping(
+    existing: &HashMap<i32, (String, i32)>,
+    broker_id: i32,
+    host: &str,
+    port: i32,
+    log_ctx: &str,
+) {
+    if let Some((other_id, _)) = existing
+        .iter()
+        .find(|(id, endpoint)| **id != broker_id && endpoint.0 == host && endpoint.1 == port)
+    {
+        panic!(
+            "{} fatal broker mapping collision: brokers {} and {} both mapped to downstream {}:{}",
+            log_ctx, other_id, broker_id, host, port
+        );
+    }
+}
+
+fn update_port_offset_assignments(
+    mode: &BrokerAdvertiseMode,
+    ids: &[i32],
+    replace_existing: bool,
+    log_ctx: &str,
+) -> Result<()> {
+    if let BrokerAdvertiseMode::PortOffset {
+        state,
+        hostname,
+        base_port,
+        bootstrap_reserved,
+        max_broker_id,
+        ..
+    } = mode
+    {
+        let mut guard = state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("port_offset state lock poisoned"))?;
+        let before = guard.id_to_endpoint.len();
+        guard.update_ids(
+            ids,
+            hostname,
+            *base_port,
+            *bootstrap_reserved,
+            *max_broker_id,
+            replace_existing,
+            log_ctx,
+        )?;
+        let after = guard.id_to_endpoint.len();
+        if after != before {
+            info!(
+                "{} updated port_offset broker slot assignments: {} known broker ids",
+                log_ctx, after
+            );
+        }
+    }
+    Ok(())
 }

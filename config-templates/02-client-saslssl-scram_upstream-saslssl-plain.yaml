@@ -1,0 +1,38 @@
+bind_address: "0.0.0.0"
+
+upstream:
+  bootstrap_servers:
+    - "pkc-312o0.ap-southeast-1.aws.confluent.cloud:9092"
+  security_protocol: "SASL_SSL"
+  sasl_mechanism: "PLAIN"
+  tls:
+    ca_certs: "server_ca.pem"
+    trust_server_certs: false
+
+downstream:
+  security_protocol: "SASL_SSL"
+  sasl_mechanism: "SCRAM-512" # also supports SCRAM-SHA-512
+  tls:
+    mtls_enabled: false
+    cert: "server.pem"
+    key: "key.pem"
+    # ca_certs only needed when mtls_enabled=true
+    ca_certs: "ca.pem"
+
+broker_mapping:
+  mode: "sni"
+  sni:
+    bind_port: 9092
+    upstream: "(.*)"
+    downstream: "b<$id>.beatbox.com"
+
+auth_swap:
+  enabled: true
+  downstream_credentials:
+    - "alice=scramsecret"
+  upstream_credentials:
+    - "${APIK1}=${APIS1}" # supports env vars for secrets
+  mapping:
+    - "alice=${APIK1}"
+
+resolve: []
