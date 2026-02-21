@@ -2,7 +2,7 @@
 A config-driven Kafka proxy written in Rust.
 
 ## Performance Snapshot
-The proxy can sustain ~1.0-1.17 GiB/s in a local benchmark while using about 24-25% of one CPU core and ~5.6 MiB RSS.
+The proxy can sustain ~1.0-1.17 GiB/s in a local benchmark while using about 24-25% of one CPU core and ~5.6 MiB memory.
 
 Benchmark setup: Kafka backend on RAM disk.
 
