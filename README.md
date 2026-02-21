@@ -47,15 +47,34 @@ RssShmem:              0 kB
 - Optional auth swap between downstream identity and upstream SASL credentials.
 
 ## Mapping Modes
-- `sni`
-  - Single TLS listener.
-  - Host rewrite via regex/template (`broker_mapping.sni.upstream`/`broker_mapping.sni.downstream`).
-  - Unknown pre-learn SNI routes to the default upstream bootstrap.
-- `port_offset`
-  - Port-based downstream mapping.
-  - Reserved bootstrap window at `base..base+19`.
-  - Broker listeners begin at `base+20+broker_id`.
-  - Topology updates reconcile listeners/routes.
+### `sni`
+Best when you want one listener port and hostname-based routing.
+
+- Requires downstream TLS (uses SNI from client handshake).
+- Single listener port (`broker_mapping.sni.bind_port`) for bootstrap and brokers.
+- Hostname rewrite is rule-driven with regex + template:
+  - `broker_mapping.sni.upstream` (match regex)
+  - `broker_mapping.sni.downstream` (replacement template, supports capture groups and `<$id>`)
+- Deterministic behavior:
+  - For a given upstream hostname + broker id, the same downstream hostname is always generated.
+  - Broker id to downstream endpoint mapping is held stable across updates (inconsistencies are treated as fatal).
+- Convergence behavior:
+  - Before route learning, unknown SNI hostnames fall back to the default upstream bootstrap.
+  - After `Metadata`/`FindCoordinator`/`DescribeCluster` responses are seen, routing becomes broker-specific.
+
+### `port_offset`
+Best when you want deterministic routing by port and support plaintext clients easily.
+
+- Uses a fixed downstream hostname and deterministic port mapping.
+- Deterministic formula:
+  - bootstrap reserved range: `base..base+19`
+  - broker listener port: `base + 20 + broker_id`
+- `base..base+19` routes to the first upstream bootstrap servers (up to 20 entries).
+- Safety guardrails:
+  - `max_broker_id` bounds accepted broker ids.
+  - Endpoint collisions and out-of-range computed ports are treated as errors.
+- Operational benefit:
+  - Clients can route by static hostname+port without SNI, useful for non-TLS or simpler network setups.
 
 ## Security and Auth
 - Downstream TLS termination with `server.pem` + `server_key.pem`.
@@ -106,6 +125,24 @@ cargo run -- --config config.yaml
 Environment variable expansion is supported inside YAML:
 - `${VAR}`: required, non-empty.
 - `${VAR:default}`: fallback to `default` when undefined/empty.
+
+### DNS Resolution Customization (`resolve`)
+Use `resolve` to override upstream host DNS lookups directly in config.
+
+```yaml
+resolve:
+  - host: "pkc-312o0.ap-southeast-1.aws.confluent.cloud"
+    ipv4: "10.10.10.10"
+  - host: "*.aws.confluent.cloud"
+    ipv4: "10.10.10.20"
+  - host: "broker-v6.internal"
+    ipv6: "2001:db8::10"
+```
+
+Notes:
+- Both exact and `*` wildcard hosts are supported.
+- Exact host rules win over wildcard rules.
+- If multiple wildcard rules match, the more specific one wins; if still tied, the later entry wins.
 
 ## Templates
 See `config-templates/`:
