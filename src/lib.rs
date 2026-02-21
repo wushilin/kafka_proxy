@@ -40,7 +40,9 @@ pub async fn run(args: Args) -> Result<()> {
             .as_deref()
             .ok_or_else(|| anyhow!("--sni-suffix is required with --generate-certs"))?;
         generate_default_certs(sni_suffix)?;
-        info!("Generated cert files: ca.pem, server.pem, key.pem");
+        info!(
+            "Generated cert files: ca.pem, server.pem, server_key.pem, client1.pem, client1_key.pem, client2.pem, client2_key.pem"
+        );
         return Ok(());
     }
 
@@ -119,7 +121,9 @@ pub async fn run(args: Args) -> Result<()> {
         ));
     }
     let cert_path = downstream_tls.and_then(|t| t.cert.as_deref()).unwrap_or("server.pem");
-    let key_path = downstream_tls.and_then(|t| t.key.as_deref()).unwrap_or("key.pem");
+    let key_path = downstream_tls
+        .and_then(|t| t.key.as_deref())
+        .unwrap_or("server_key.pem");
     let mtls_enabled = downstream_tls.and_then(|t| t.mtls_enabled).unwrap_or(false);
     let downstream_ca_path = downstream_tls.and_then(|t| t.ca_certs.as_deref());
 

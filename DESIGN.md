@@ -65,7 +65,7 @@ The proxy is configured via command-line arguments:
 | `--bind` | Listen address and port | `0.0.0.0:9092` |
 | `--sni-suffix` | Expected SNI suffix for broker identification | `kafka.abc.com` |
 | `--cert` | Server TLS certificate | `cert.pem` |
-| `--key` | Server private key | `key.pem` |
+| `--key` | Server private key | `server_key.pem` |
 | `--ca-certs` | CA certificates for mTLS (optional) | `ca.pem` |
 | `--mtls-enable` | Enable mutual TLS | |
 | `--mtls-disable` | Disable mutual TLS (default) | |

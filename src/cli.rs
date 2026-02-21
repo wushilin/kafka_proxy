@@ -8,7 +8,7 @@ pub struct Args {
     #[arg(short = 'c', long, default_value = "config.yaml")]
     pub config: String,
 
-    /// Generate ca.pem, server.pem, key.pem in the current directory and exit
+    /// Generate ca.pem, server.pem, server_key.pem, client1.pem/client1_key.pem, client2.pem/client2_key.pem in the current directory and exit
     #[arg(long)]
     pub generate_certs: bool,
 

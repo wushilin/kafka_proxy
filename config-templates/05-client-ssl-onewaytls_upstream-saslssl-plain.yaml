@@ -10,13 +10,11 @@ upstream:
     trust_server_certs: false
 
 downstream:
-  security_protocol: "SASL_SSL"
-  sasl_mechanism: "SCRAM-512" # also supports SCRAM-SHA-512
+  security_protocol: "SSL"
   tls:
     mtls_enabled: false
     cert: "server.pem"
     key: "server_key.pem"
-    # ca_certs only needed when mtls_enabled=true
     ca_certs: "ca.pem"
 
 broker_mapping:
@@ -28,11 +26,10 @@ broker_mapping:
 
 auth_swap:
   enabled: true
-  downstream_credentials:
-    - "alice=scramsecret"
+  # one-way TLS -> downstream principal resolves as $anonymous
   upstream_credentials:
-    - "${APIK1}=${APIS1}" # supports env vars for secrets
+    - "${APIK1}=${APIS1}"
   mapping:
-    - "alice=${APIK1}"
+    - "$anonymous=${APIK1}"
 
 resolve: []

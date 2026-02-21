@@ -41,15 +41,15 @@ impl AuthSwap {
         }))
     }
 
-    pub fn requires_downstream_auth(&self) -> bool {
-        self.downstream_credentials.is_some()
-    }
-
     pub fn resolve_upstream_credential(
         &self,
         downstream_principal: Option<&str>,
+        use_present_principal_without_downstream_credentials: bool,
     ) -> Result<ResolvedAuth> {
         let principal = match (&self.downstream_credentials, downstream_principal) {
+            (None, Some(p)) if use_present_principal_without_downstream_credentials => {
+                p.to_string()
+            }
             (None, _) => ANONYMOUS.to_string(),
             (Some(_), Some(p)) => p.to_string(),
             (Some(_), None) => {

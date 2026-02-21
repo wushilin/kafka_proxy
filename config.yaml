@@ -18,7 +18,7 @@ downstream:
     mtls_enabled: true
     ca_certs: ca.pem
     cert: server.pem
-    key: key.pem
+    key: server_key.pem
 broker_mapping:
   mode: sni
   sni:

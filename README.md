@@ -16,7 +16,7 @@ SNI-based Kafka TLS proxy that:
 - High-performance, low-overhead forwarding for Kafka traffic.
 - Zero-copy passthrough for response types that do not require rewrite.
 - Lightweight runtime profile (minimal allocations on hot path).
-- Client-side TLS termination (`server.pem`/`key.pem`).
+- Client-side TLS termination (`server.pem`/`server_key.pem`).
 - Optional mTLS for clients (`--mtls-enable`, `--ca-certs`).
 - Upstream TLS with verification by:
   - system trust roots (default), or
@@ -80,7 +80,7 @@ Resolution rules:
 - `--bind` (default: `0.0.0.0:9092`)
 - `--sni-suffix`
 - `--cert` (default: `server.pem`)
-- `--key` (default: `key.pem`)
+- `--key` (default: `server_key.pem`)
 - `--upstream` (comma-separated)
 - `--mtls-enable` / `--mtls-disable`
 - `--ca-certs`

@@ -28,7 +28,15 @@ pub fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
 }
 
 pub fn generate_default_certs(sni_suffix: &str) -> Result<()> {
-    for path in ["ca.pem", "server.pem", "key.pem"] {
+    for path in [
+        "ca.pem",
+        "server.pem",
+        "server_key.pem",
+        "client1.pem",
+        "client1_key.pem",
+        "client2.pem",
+        "client2_key.pem",
+    ] {
         if std::path::Path::new(path).exists() {
             return Err(anyhow!(
                 "Refusing to overwrite existing file: {}. Remove it first or move it aside.",
@@ -83,9 +91,44 @@ pub fn generate_default_certs(sni_suffix: &str) -> Result<()> {
     let ca_pem = ca_cert.pem();
     let server_pem = server_cert.pem();
 
+    let client1_key = KeyPair::generate().context("Failed to generate client1 key")?;
+    let mut client1_params = CertificateParams::new(Vec::new())
+        .context("Failed to build client1 certificate params")?;
+    client1_params.not_before = not_before;
+    client1_params.not_after = not_after;
+    client1_params.is_ca = IsCa::NoCa;
+    client1_params.distinguished_name = DistinguishedName::new();
+    client1_params
+        .distinguished_name
+        .push(DnType::CommonName, "client1");
+    let client1_cert = client1_params
+        .signed_by(&client1_key, &ca_cert, &ca_key)
+        .context("Failed to sign client1 certificate")?;
+
+    let client2_key = KeyPair::generate().context("Failed to generate client2 key")?;
+    let mut client2_params = CertificateParams::new(Vec::new())
+        .context("Failed to build client2 certificate params")?;
+    client2_params.not_before = not_before;
+    client2_params.not_after = not_after;
+    client2_params.is_ca = IsCa::NoCa;
+    client2_params.distinguished_name = DistinguishedName::new();
+    client2_params
+        .distinguished_name
+        .push(DnType::CommonName, "client2");
+    let client2_cert = client2_params
+        .signed_by(&client2_key, &ca_cert, &ca_key)
+        .context("Failed to sign client2 certificate")?;
+
     fs::write("ca.pem", ca_pem).context("Failed to write ca.pem")?;
     fs::write("server.pem", server_pem).context("Failed to write server.pem")?;
-    fs::write("key.pem", server_key.serialize_pem()).context("Failed to write key.pem")?;
+    fs::write("server_key.pem", server_key.serialize_pem())
+        .context("Failed to write server_key.pem")?;
+    fs::write("client1.pem", client1_cert.pem()).context("Failed to write client1.pem")?;
+    fs::write("client1_key.pem", client1_key.serialize_pem())
+        .context("Failed to write client1_key.pem")?;
+    fs::write("client2.pem", client2_cert.pem()).context("Failed to write client2.pem")?;
+    fs::write("client2_key.pem", client2_key.serialize_pem())
+        .context("Failed to write client2_key.pem")?;
 
     Ok(())
 }

@@ -31,6 +31,7 @@ use tokio_rustls::server::TlsStream as DownstreamTlsStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use x509_parser::parse_x509_certificate;
 type HmacSha256 = Hmac<sha2::Sha256>;
 type HmacSha512 = Hmac<sha2::Sha512>;
 
@@ -64,6 +65,20 @@ fn format_topology_map(map: &HashMap<i32, String>) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("{{{}}}", body)
+}
+
+fn cert_dn_summary(cert_der: &[u8]) -> Option<(String, String)> {
+    let (_, cert) = parse_x509_certificate(cert_der).ok()?;
+    Some((
+        cert.subject().to_string(),
+        cert.issuer().to_string(),
+    ))
+}
+
+fn cert_common_name(cert_der: &[u8]) -> Option<String> {
+    let (_, cert) = parse_x509_certificate(cert_der).ok()?;
+    let cn = cert.subject().iter_common_name().next()?;
+    Some(cn.as_str().ok()?.to_string())
 }
 
 #[derive(Debug)]
@@ -595,13 +610,15 @@ async fn run_auth_swap_bootstrap<C, U>(
     auth_swap: &AuthSwap,
     downstream_mechanism: Option<&str>,
     upstream_mechanism: Option<&str>,
+    downstream_preauth_principal: Option<&str>,
     conn_ctx: &str,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut downstream_principal: Option<String> = None;
+    let mut downstream_principal: Option<String> =
+        downstream_preauth_principal.map(|s| s.to_string());
 
     if let Some(downstream_mechanism) = downstream_mechanism {
         let requested_mechanism = normalize_mechanism(downstream_mechanism);
@@ -825,13 +842,14 @@ where
             )
             .await?;
         }
-    } else if auth_swap.requires_downstream_auth() {
-        return Err(anyhow!(
-            "auth_swap downstream credentials configured but downstream SASL is not configured"
-        ));
     }
 
-    let resolved = auth_swap.resolve_upstream_credential(downstream_principal.as_deref())?;
+    let use_preauth_identity_for_mapping =
+        downstream_mechanism.is_none() && downstream_preauth_principal.is_some();
+    let resolved = auth_swap.resolve_upstream_credential(
+        downstream_principal.as_deref(),
+        use_preauth_identity_for_mapping,
+    )?;
     info!(
         "{} auth_swap resolved downstream principal '{}' -> upstream principal '{}'",
         conn_ctx, resolved.downstream_principal, resolved.mapped_principal
@@ -1028,6 +1046,7 @@ async fn forward_client_to_upstream<R, W>(
     upstream_write: &mut W,
     in_flight: Arc<Mutex<HashMap<i32, (ApiKey, i16)>>>,
     client_addr: SocketAddr,
+    reject_downstream_sasl_frames: bool,
     conn_ctx: &str,
     stats: Arc<ProxyStats>,
 ) -> Result<()>
@@ -1068,6 +1087,15 @@ where
             let correlation_id = i32::from_be_bytes([header[4], header[5], header[6], header[7]]);
             match ApiKey::try_from(api_key_raw) {
                 Ok(api_key) => {
+                    if reject_downstream_sasl_frames
+                        && matches!(api_key, ApiKey::SaslHandshake | ApiKey::SaslAuthenticate)
+                    {
+                        return Err(anyhow!(
+                            "{} unexpected downstream SASL frame {:?} after auth bootstrap; closing connection",
+                            conn_ctx,
+                            api_key
+                        ));
+                    }
                     let mut map = in_flight.lock().await;
                     map.insert(correlation_id, (api_key, api_version));
                     tracing::debug!(
@@ -1451,21 +1479,44 @@ async fn proxy_connection(
         .local_addr()
         .context("Failed to read local listener address")?
         .port();
-    let (downstream_stream, sni) = if let Some(acceptor) = acceptor {
+    let (downstream_stream, sni, downstream_tls_principal) = if let Some(acceptor) = acceptor {
         let tls_stream = acceptor
             .accept(client_stream)
             .await
             .context("TLS handshake failed")?;
         let (_io, server_conn) = tls_stream.get_ref();
         let sni = server_conn.server_name().unwrap_or("").to_string();
-        (EitherDownstreamStream::Tls(tls_stream), sni)
+        let mut principal: Option<String> = Some("$anonymous".to_string());
+        if let Some(chain) = server_conn.peer_certificates() {
+            if let Some(leaf) = chain.first() {
+                if let Some((subject_dn, issuer_dn)) = cert_dn_summary(leaf.as_ref()) {
+                    info!(
+                        "client_conn={} authenticated client certificate subject_dn='{}' issuer_dn='{}'",
+                        client_conn_id, subject_dn, issuer_dn
+                    );
+                } else {
+                    info!(
+                        "client_conn={} authenticated client certificate present, but DN parse failed",
+                        client_conn_id
+                    );
+                }
+                if let Some(cn) = cert_common_name(leaf.as_ref()) {
+                    principal = Some(cn.clone());
+                    info!(
+                        "client_conn={} mTLS principal derived from certificate CN='{}'",
+                        client_conn_id, cn
+                    );
+                }
+            }
+        }
+        (EitherDownstreamStream::Tls(tls_stream), sni, principal)
     } else {
         let peer = client_stream.peer_addr().ok();
         info!(
             "client_conn={} plaintext downstream connection from {:?}",
             client_conn_id, peer
         );
-        (EitherDownstreamStream::Plain(client_stream), String::new())
+        (EitherDownstreamStream::Plain(client_stream), String::new(), None)
     };
 
     if matches!(advertise_mode.as_ref(), BrokerAdvertiseMode::Sni { .. }) && sni.is_empty() {
@@ -1619,6 +1670,7 @@ async fn proxy_connection(
         auth_swap,
         downstream_sasl_mechanism,
         upstream_sasl_mechanism,
+        downstream_tls_principal,
         advertise_mode,
         listener_spawner,
         upstream_routes,
@@ -1645,6 +1697,7 @@ async fn run_proxy_data_plane(
     auth_swap: Option<Arc<AuthSwap>>,
     downstream_sasl_mechanism: Option<Arc<String>>,
     upstream_sasl_mechanism: Option<Arc<String>>,
+    downstream_tls_principal: Option<String>,
     advertise_mode: Arc<BrokerAdvertiseMode>,
     listener_spawner: Option<Arc<ListenerSpawner>>,
     upstream_routes: Arc<Mutex<HashMap<String, String>>>,
@@ -1661,6 +1714,7 @@ async fn run_proxy_data_plane(
                     auth_swap,
                     downstream_sasl_mechanism.as_deref().map(|s| s.as_str()),
                     upstream_sasl_mechanism.as_deref().map(|s| s.as_str()),
+                    downstream_tls_principal.as_deref(),
                     &conn_ctx,
                 )
                 .await
@@ -1672,6 +1726,7 @@ async fn run_proxy_data_plane(
                     auth_swap,
                     downstream_sasl_mechanism.as_deref().map(|s| s.as_str()),
                     upstream_sasl_mechanism.as_deref().map(|s| s.as_str()),
+                    downstream_tls_principal.as_deref(),
                     &conn_ctx,
                 )
                 .await
@@ -1683,6 +1738,7 @@ async fn run_proxy_data_plane(
                     auth_swap,
                     downstream_sasl_mechanism.as_deref().map(|s| s.as_str()),
                     upstream_sasl_mechanism.as_deref().map(|s| s.as_str()),
+                    downstream_tls_principal.as_deref(),
                     &conn_ctx,
                 )
                 .await
@@ -1694,6 +1750,7 @@ async fn run_proxy_data_plane(
                     auth_swap,
                     downstream_sasl_mechanism.as_deref().map(|s| s.as_str()),
                     upstream_sasl_mechanism.as_deref().map(|s| s.as_str()),
+                    downstream_tls_principal.as_deref(),
                     &conn_ctx,
                 )
                 .await
@@ -1728,12 +1785,14 @@ async fn run_proxy_data_plane(
     };
 
     let in_flight: Arc<Mutex<HashMap<i32, (ApiKey, i16)>>> = Arc::new(Mutex::new(HashMap::new()));
+    let reject_downstream_sasl_frames = auth_swap.is_some();
 
     let client_to_upstream = forward_client_to_upstream(
         &mut client_read,
         &mut upstream_write,
         in_flight.clone(),
         client_addr,
+        reject_downstream_sasl_frames,
         &conn_ctx,
         stats.clone(),
     );
@@ -2321,10 +2380,11 @@ async fn run_accept_loop(
                     )
                     .await
                     {
-                        error!("Error handling connection from {}: {}", addr, e);
                         if is_fatal_proxy_error(&e) {
                             error!("Fatal proxy error detected; shutting down process: {}", e);
                             std::process::exit(1);
+                        } else {
+                            info!("Connection from {} closed: {}", addr, e);
                         }
                     }
                 });
