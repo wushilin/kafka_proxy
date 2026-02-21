@@ -50,6 +50,8 @@ RssShmem:              0 kB
 
 ## Mapping Modes
 ### `sni`
+If you enable TLS to your client, you only need 1 port number!
+
 Best when you want one listener port and hostname-based routing.
 
 - Requires downstream TLS (uses SNI from client handshake).
