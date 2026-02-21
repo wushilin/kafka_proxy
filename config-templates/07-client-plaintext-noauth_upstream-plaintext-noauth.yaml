@@ -1,0 +1,24 @@
+bind_address: "0.0.0.0"
+
+upstream:
+  bootstrap_servers:
+    - "pkc-312o0.ap-southeast-1.aws.confluent.cloud:9092"
+  security_protocol: "PLAINTEXT"
+
+
+downstream:
+  security_protocol: "PLAINTEXT"
+  # no sasl_mechanism => no client auth
+
+broker_mapping:
+  mode: "port_offset"
+  port_offset:
+    hostname: "broker.beatbox.com"
+    base: 9092
+    max_broker_id: 64
+
+auth_swap:
+  enabled: false
+  upstream_credentials: []
+
+resolve: []

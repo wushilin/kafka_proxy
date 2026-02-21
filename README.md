@@ -1,97 +1,91 @@
-# Kafka SNI Proxy
-Use this if your backend is Confluent Cloud. it is super easy to setup, battery included. Scales to gigabits per second with only less than 10% CPU utilization on one core.
+# Kafka Proxy
+High-performance Kafka proxy focused on low CPU/memory overhead.
 
-# Highlights
+## Highlights
+- Zero-copy streaming for non-rewritten response paths.
+- Selective Kafka response rewrite for:
+  - `Metadata`
+  - `FindCoordinator`
+  - `DescribeCluster`
+- Config-file driven runtime (`config.yaml` by default).
+- Supports downstream:
+  - `PLAINTEXT`
+  - `SASL_PLAINTEXT`
+  - `SSL`
+  - `SASL_SSL`
+- Supports upstream:
+  - `PLAINTEXT`
+  - `SASL_PLAINTEXT`
+  - `SSL`
+  - `SASL_SSL`
+- Auth swap between downstream identity and upstream SASL credentials.
 
-SNI-based Kafka TLS proxy that:
-- Is high-performance and lightweight for production traffic.
-- Uses a zero-copy streaming path for non-rewritten Kafka responses.
-- Terminates TLS from clients.
-- Connects to upstream brokers over TLS.
-- Rewrites broker host/port in selected Kafka responses so clients reconnect through the proxy.
-- Learns broker routes dynamically from metadata/coordinator responses.
+## Mapping Modes
+- `sni`:
+  - Single TLS listener.
+  - Host rewrite via regex/template (`upstream`/`downstream` rule).
+  - Unknown pre-learn SNI routes to default upstream bootstrap.
+- `port_offset`:
+  - Port-based downstream mapping.
+  - Reserved bootstrap window at `base..base+19`.
+  - Broker listeners begin at `base+20+broker_id`.
+  - Full topology snapshots reconcile listeners/routes (add/remove).
 
-## Features
+## Security and Auth
+- Downstream TLS termination with `server.pem` + `server_key.pem`.
+- Optional downstream mTLS.
+- Upstream TLS:
+  - system CA (default), or
+  - custom CA (`upstream.tls.ca_certs`), or
+  - trust-all (`upstream.tls.trust_server_certs: true`).
+- Downstream SASL mechanisms:
+  - `PLAIN`
+  - `SCRAM-256` / `SCRAM-SHA-256`
+  - `SCRAM-512` / `SCRAM-SHA-512`
+- Upstream SASL mechanisms:
+  - `PLAIN`
+  - `SCRAM-256` / `SCRAM-SHA-256`
+  - `SCRAM-512` / `SCRAM-SHA-512`
+- SSL-only downstream auth-swap identity:
+  - one-way TLS => `$anonymous`
+  - mTLS => certificate `CN`
 
-- High-performance, low-overhead forwarding for Kafka traffic.
-- Zero-copy passthrough for response types that do not require rewrite.
-- Lightweight runtime profile (minimal allocations on hot path).
-- Client-side TLS termination (`server.pem`/`server_key.pem`).
-- Optional mTLS for clients (`--mtls-enable`, `--ca-certs`).
-- Upstream TLS with verification by:
-  - system trust roots (default), or
-  - custom CA bundle (`--upstream-ca-certs`), or
-  - trust-all mode (`--trust-upstream-certs`, test only).
-- Dynamic route learning from:
-  - `MetadataResponse`
-  - `FindCoordinatorResponse`
-  - `DescribeClusterResponse`
-- Bootstrap route available by default:
-  - `bootstrap.<sni-suffix>` -> first `--upstream`
-- Flexible hostname rewrite rule:
-  - `--broker-mapping-rule "<regex>::<replacement>"`
-  - falls back to `b<id>.<sni-suffix>` if no rule match.
-- Optional upstream hosts override file with wildcard support:
-  - `--hosts-file <path>`
-  - hosts-file match takes priority over DNS; otherwise falls back to system DNS.
-
-## Quick Start
-
-Generate certs in current directory:
-
+## Cert Utilities
+Generate certs:
 ```bash
-cargo run -- --sni-suffix beatbox.com --generate-certs
+cargo run -- --generate-certs --sni-suffix beatbox.com
 ```
+Generated files:
+- `ca.pem`
+- `server.pem`
+- `server_key.pem`
+- `client1.pem`
+- `client1_key.pem`
+- `client2.pem`
+- `client2_key.pem`
 
-Run proxy:
-
+Save issuer cert from upstream server:
 ```bash
-cargo run -- \
-  --bind 0.0.0.0:9092 \
-  --sni-suffix beatbox.com \
-  --upstream lkc-abcde.confluent.cloud:9092
+cargo run -- --save-ca-certs --server pkc-xxxxx.region.aws.confluent.cloud:9092
 ```
+Writes `server_ca.pem`.
 
-With custom upstream CA:
-
+## Config
+Run with config file:
 ```bash
-cargo run -- \
-  --sni-suffix beatbox.com \
-  --upstream lkc-abcde.confluent.cloud:9092 \
-  --upstream-ca-certs ca.pem
+cargo run -- --config config.yaml
 ```
+`--config` defaults to `config.yaml`.
 
-## Hosts File
+Environment variable expansion is supported inside YAML:
+- `${VAR}`: required, non-empty.
+- `${VAR:default}`: fallback to `default` when undefined/empty.
 
-Example file:
-
-```text
-192.165.22.33 b0.upstream.com *.upstream.com *.abc.upstream.com
-```
-
-Resolution rules:
-1. Specific hostname wins over wildcard.
-2. For wildcards, longer wildcard pattern wins.
-3. If still tied, later definition wins.
-4. `*` does not match `.`.
-
-## CLI Flags
-
-- `--bind` (default: `0.0.0.0:9092`)
-- `--sni-suffix`
-- `--cert` (default: `server.pem`)
-- `--key` (default: `server_key.pem`)
-- `--upstream` (comma-separated)
-- `--mtls-enable` / `--mtls-disable`
-- `--ca-certs`
-- `--upstream-ca-certs`
-- `--trust-upstream-certs`
-- `--generate-certs`
-- `--broker-mapping-rule`
-- `--hosts-file`
-
-## Notes
-
-- mTLS is disabled by default.
-- Generated certs are valid for 20 years.
-- Rewrite path is selective: non-target APIs stream through without full-frame mutation.
+## Templates
+See `config-templates/`:
+- `01-client-plaintext-noauth_upstream-saslssl-plain.yaml`
+- `02-client-saslssl-scram_upstream-saslssl-plain.yaml`
+- `03-client-saslplaintext-plain_upstream-saslssl-plain.yaml`
+- `04-client-mtls-with-sasl-scram256-server-saslssl-plain.yaml`
+- `05-client-ssl-onewaytls_upstream-saslssl-plain.yaml`
+- `06-client-ssl-mtls_upstream-saslssl-plain.yaml`
