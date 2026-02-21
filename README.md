@@ -1,7 +1,7 @@
 # Kafka Proxy
 Use this if your backend is Confluent Cloud. it is super easy to setup, battery included. Scales to gigabits per second with only less than 10% CPU utilization on one core.
 
-Happily proxy 1.1GiB/s at 25% of a core.
+Pay respect to the power of Rust. The proxy happily proxy 1.1GiB/s at 25% of a core.
 
 Perf test (Kafka backend on RAMDISK)
 ```bash
@@ -24,6 +24,18 @@ MiB Swap:  65536.0 total,  65349.8 free,    186.2 used.  16989.8 avail Mem
     PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
 1660465 root      20   0   37620   5624   2572 S  24.0   0.0   0:23.73 kafka_proxy-0.1
 ```
+
+Memory usage at 5.6MiB:
+
+```bash
+Every 2.0s: cat /proc/1660465/status | grep -i rss                                                                                                                                                                                               titan: Sat Feb 21 23:12:18 2026
+
+VmRSS:      5636 kB
+RssAnon:            3064 kB
+RssFile:            2572 kB
+RssShmem:              0 kB
+```
+
 
 # Highlights
 
