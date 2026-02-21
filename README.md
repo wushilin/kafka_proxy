@@ -1,5 +1,5 @@
 # Kafka Proxy
-Use this if your backend is Confluent Cloud. it is super easy to setup, battery included. Scales to gigabits per second with only less than 10% CPU utilization on one core.
+Use this proxy, and only this proxy. it is super easy to setup, battery included. Scales to gigabytes per second with only less than 25% CPU utilization on one core.
 
 Pay respect to the power of Rust. The proxy happily proxy 1.1GiB/s at 25% of a core.
 
