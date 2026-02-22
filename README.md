@@ -79,9 +79,12 @@ Best when you want deterministic routing by port and support plaintext clients e
 
 - Uses a fixed downstream hostname and deterministic port mapping.
 - Deterministic formula:
-  - bootstrap reserved range: `base..base+19`
-  - broker listener port: `base + 20 + broker_id`
-- `base..base+19` routes to the first upstream bootstrap servers (up to 20 entries).
+  - base port maps to first bootstrap server (in your upsream bootstrap list)
+  - base port + 1 maps to second bootstrap server (in your upstream bootstrap list, not used if you do not have this second bootstrap server)
+  - ...
+  - base port + 19 maps to the 20th bootstrap server (in your upstream bootstrap list, not used if you do not have this 20th bootstrap server)
+  - Therefore, the ports reserved for bootstrap servers ranges in `base..base+19`
+  - broker listener port: `base + 20 + broker_id` (broker_id 0 is port base + 20, broker_id 4 is port base + 24). All these ports must be free and bindable. Otherwise program will fail and exit.
 - Safety guardrails:
   - `max_broker_id` bounds accepted broker ids.
   - Endpoint collisions and out-of-range computed ports are treated as errors.
