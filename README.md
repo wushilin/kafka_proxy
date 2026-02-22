@@ -49,7 +49,9 @@ RssShmem:              0 kB
 - Optional auth swap between downstream identity and upstream SASL credentials.
 - Performance focused, almost Zero Memory Re-allocation, almost Zero Copy
   
-## Mapping Modes
+## Proxy to Backend Broker Mapping Modes
+The project is focused on simplicity and offer 2 modes. Botho modes are deterministic, safe and Load Balancer friendly out of the box!
+
 ### `sni`
 If you enable TLS to your client, you only need 1 port number!
 
