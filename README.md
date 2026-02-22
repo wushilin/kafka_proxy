@@ -48,6 +48,7 @@ RssShmem:              0 kB
 - Supports upstream: `PLAINTEXT`, `SASL_PLAINTEXT`, `SSL`, `SASL_SSL`.
 - Optional auth swap between downstream identity and upstream SASL credentials.
 - Performance focused, almost Zero Memory Re-allocation, almost Zero Copy
+- Supports custom DNS resolution out of the box, you do not need to configure your private hosted zone in your cloud!
   
 ## Proxy to Backend Broker Mapping Modes
 The project is focused on simplicity and offer 2 modes. Botho modes are deterministic, safe and Load Balancer friendly out of the box!
