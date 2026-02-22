@@ -1237,7 +1237,7 @@ where
                         .context("Failed to read full rewritable response payload")?;
                     let frame_bytes = rewrite_frame.split_to(frame_len).freeze();
 
-                    match maybe_rewrite_kafka_response(
+                    let rewritten_payload = match maybe_rewrite_kafka_response(
                         &frame_bytes,
                         api_key,
                         api_version,
@@ -1425,7 +1425,11 @@ where
                                 e
                             ));
                         }
+                    };
+                    if matches!(api_key, ApiKey::Fetch) {
+                        rewrite_frame = BytesMut::with_capacity(1024);
                     }
+                    rewritten_payload
                 } else {
                     stats.passthrough_responses.fetch_add(1, Ordering::Relaxed);
                     tracing::debug!(
