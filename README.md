@@ -47,7 +47,8 @@ RssShmem:              0 kB
 - Supports downstream: `PLAINTEXT`, `SASL_PLAINTEXT`, `SSL`, `SASL_SSL`.
 - Supports upstream: `PLAINTEXT`, `SASL_PLAINTEXT`, `SSL`, `SASL_SSL`.
 - Optional auth swap between downstream identity and upstream SASL credentials.
-
+- Performance focused, almost Zero Memory Re-allocation, almost Zero Copy
+  
 ## Mapping Modes
 ### `sni`
 If you enable TLS to your client, you only need 1 port number!
