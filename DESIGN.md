@@ -120,6 +120,10 @@ The proxy rewrites only the broker/coordinator location fields in selected respo
 - `MetadataResponse`
 - `FindCoordinatorResponse`
 - `DescribeClusterResponse`
+- `FetchResponse` (v16+ `node_endpoints`)
+- `ProduceResponse` (v10+ `node_endpoints`)
+- `ShareFetchResponse` (`node_endpoints`)
+- `ShareAcknowledgeResponse` (`node_endpoints`)
 
 Behavior:
 

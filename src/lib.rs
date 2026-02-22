@@ -22,6 +22,7 @@ use crate::upstream::{build_upstream_map, build_upstream_tls_connector};
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
 use rustls::pki_types::CertificateDer;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -339,6 +340,8 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
     let upstream_routes = Arc::new(Mutex::new(initial_routes));
+    let upstream_route_owners: Arc<Mutex<HashMap<String, i32>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let downstream_sasl_mechanism = downstream_sasl_mechanism.map(Arc::new);
     let upstream_sasl_mechanism = upstream_sasl_mechanism.map(Arc::new);
     let stats = ProxyStats::shared();
@@ -397,6 +400,7 @@ pub async fn run(args: Args) -> Result<()> {
         upstream_sasl_mechanism,
         advertise_mode,
         upstream_routes,
+        upstream_route_owners,
         default_upstream,
         stats,
     )

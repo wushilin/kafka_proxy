@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use bytes::{Buf, Bytes, BytesMut};
 use kafka_protocol::messages::{
-    ApiKey, DescribeClusterResponse, FindCoordinatorResponse, MetadataResponse, ResponseHeader,
-    ResponseKind,
+    ApiKey, DescribeClusterResponse, FetchResponse, FindCoordinatorResponse, MetadataResponse,
+    ProduceResponse, ResponseHeader, ResponseKind, ShareAcknowledgeResponse, ShareFetchResponse,
 };
 use kafka_protocol::protocol::{Decodable, Encodable, Message};
 use regex::Regex;
@@ -168,14 +168,63 @@ fn supports_rewrite_version(api_key: ApiKey, api_version: i16) -> bool {
             DescribeClusterResponse::VERSIONS.min,
             DescribeClusterResponse::VERSIONS.max,
         ),
+        ApiKey::Fetch => in_range(FetchResponse::VERSIONS.min, FetchResponse::VERSIONS.max),
+        ApiKey::Produce => in_range(ProduceResponse::VERSIONS.min, ProduceResponse::VERSIONS.max),
+        ApiKey::ShareFetch => in_range(
+            ShareFetchResponse::VERSIONS.min,
+            ShareFetchResponse::VERSIONS.max,
+        ),
+        ApiKey::ShareAcknowledge => in_range(
+            ShareAcknowledgeResponse::VERSIONS.min,
+            ShareAcknowledgeResponse::VERSIONS.max,
+        ),
         _ => false,
     }
 }
 
+pub fn should_attempt_rewrite(api_key: ApiKey, api_version: i16) -> bool {
+    matches!(
+        api_key,
+        ApiKey::Metadata
+            | ApiKey::FindCoordinator
+            | ApiKey::DescribeCluster
+            | ApiKey::Fetch
+            | ApiKey::Produce
+            | ApiKey::ShareFetch
+            | ApiKey::ShareAcknowledge
+    ) && supports_rewrite_version(api_key, api_version)
+}
+
 pub struct RewriteOutcome {
     pub payload: Option<Bytes>,
-    pub discovered_routes: Vec<(String, String)>,
+    pub discovered_routes: Vec<DiscoveredRoute>,
     pub topology_snapshot_ids: Option<Vec<i32>>,
+}
+
+pub struct DiscoveredRoute {
+    pub key: String,
+    pub upstream_addr: String,
+    pub broker_id: i32,
+}
+
+fn remember_discovered_routes(
+    discovered_routes: &mut Vec<DiscoveredRoute>,
+    broker_id: i32,
+    upstream_addr: String,
+    route_key: Option<String>,
+) {
+    discovered_routes.push(DiscoveredRoute {
+        key: format!("b{}", broker_id),
+        upstream_addr: upstream_addr.clone(),
+        broker_id,
+    });
+    if let Some(key) = route_key {
+        discovered_routes.push(DiscoveredRoute {
+            key,
+            upstream_addr,
+            broker_id,
+        });
+    }
 }
 
 fn advertised_target(
@@ -259,7 +308,7 @@ fn advertised_target(
 }
 
 pub fn maybe_rewrite_kafka_response(
-    payload: &[u8],
+    payload: &Bytes,
     api_key: ApiKey,
     api_version: i16,
     advertise_mode: &BrokerAdvertiseMode,
@@ -267,7 +316,13 @@ pub fn maybe_rewrite_kafka_response(
 ) -> Result<RewriteOutcome> {
     if !matches!(
         api_key,
-        ApiKey::Metadata | ApiKey::FindCoordinator | ApiKey::DescribeCluster
+        ApiKey::Metadata
+            | ApiKey::FindCoordinator
+            | ApiKey::DescribeCluster
+            | ApiKey::Fetch
+            | ApiKey::Produce
+            | ApiKey::ShareFetch
+            | ApiKey::ShareAcknowledge
     ) {
         return Ok(RewriteOutcome {
             payload: None,
@@ -289,7 +344,7 @@ pub fn maybe_rewrite_kafka_response(
     }
 
     let response_header_version = api_key.response_header_version(api_version);
-    let mut decode_buf = Bytes::copy_from_slice(payload);
+    let mut decode_buf = payload.clone();
 
     let response_header = ResponseHeader::decode(&mut decode_buf, response_header_version)
         .context("Failed to decode Kafka response header")?;
@@ -327,10 +382,7 @@ pub fn maybe_rewrite_kafka_response(
                     log_ctx,
                 );
                 let upstream_addr = format!("{}:{}", original_host, original_port);
-                discovered_routes.push((format!("b{}", node_id), upstream_addr.clone()));
-                if let Some(key) = route_key {
-                    discovered_routes.push((key, upstream_addr));
-                }
+                remember_discovered_routes(&mut discovered_routes, node_id, upstream_addr, route_key);
                 broker.host = rewritten_host.clone().into();
                 broker.port = rewritten_port;
                 rewritten_any = true;
@@ -362,10 +414,7 @@ pub fn maybe_rewrite_kafka_response(
                     log_ctx,
                 );
                 let upstream_addr = format!("{}:{}", original_host, original_port);
-                discovered_routes.push((format!("b{}", node_id), upstream_addr.clone()));
-                if let Some(key) = route_key {
-                    discovered_routes.push((key, upstream_addr));
-                }
+                remember_discovered_routes(&mut discovered_routes, node_id, upstream_addr, route_key);
                 find_coordinator.host = rewritten_host.clone().into();
                 find_coordinator.port = rewritten_port;
                 rewritten_any = true;
@@ -395,10 +444,12 @@ pub fn maybe_rewrite_kafka_response(
                         log_ctx,
                     );
                     let upstream_addr = format!("{}:{}", original_host, original_port);
-                    discovered_routes.push((format!("b{}", node_id), upstream_addr.clone()));
-                    if let Some(key) = route_key {
-                        discovered_routes.push((key, upstream_addr));
-                    }
+                    remember_discovered_routes(
+                        &mut discovered_routes,
+                        node_id,
+                        upstream_addr,
+                        route_key,
+                    );
                     coordinator.host = rewritten_host.clone().into();
                     coordinator.port = rewritten_port;
                     rewritten_any = true;
@@ -433,10 +484,12 @@ pub fn maybe_rewrite_kafka_response(
                     log_ctx,
                 );
                 let upstream_addr = format!("{}:{}", original_host, original_port);
-                discovered_routes.push((format!("b{}", broker_id), upstream_addr.clone()));
-                if let Some(key) = route_key {
-                    discovered_routes.push((key, upstream_addr));
-                }
+                remember_discovered_routes(
+                    &mut discovered_routes,
+                    broker_id,
+                    upstream_addr,
+                    route_key,
+                );
                 broker.host = rewritten_host.clone().into();
                 broker.port = rewritten_port;
                 rewritten_any = true;
@@ -444,6 +497,122 @@ pub fn maybe_rewrite_kafka_response(
                 info!(
                     "{} rewrote DescribeCluster broker_id={} host='{}' -> '{}' port={}",
                     log_ctx, broker_id, original_host, rewritten_host, rewritten_port
+                );
+            }
+        }
+        ResponseKind::Fetch(fetch) => {
+            let ids: Vec<i32> = fetch.node_endpoints.iter().map(|e| e.node_id.0).collect();
+            update_port_offset_assignments(advertise_mode, &ids, false, log_ctx)?;
+            for endpoint in &mut fetch.node_endpoints {
+                let original_host = endpoint.host.as_str().to_string();
+                let node_id = endpoint.node_id.0;
+                let original_port = endpoint.port;
+                let (rewritten_host, rewritten_port, route_key) =
+                    advertised_target(advertise_mode, node_id, &original_host, log_ctx)?;
+                assert_unique_downstream_endpoint(
+                    &mut seen_downstream_endpoints,
+                    node_id,
+                    &rewritten_host,
+                    rewritten_port,
+                    log_ctx,
+                );
+                let upstream_addr = format!("{}:{}", original_host, original_port);
+                remember_discovered_routes(&mut discovered_routes, node_id, upstream_addr, route_key);
+                endpoint.host = rewritten_host.clone().into();
+                endpoint.port = rewritten_port;
+                rewritten_any = true;
+
+                info!(
+                    "{} rewrote Fetch node_endpoint node_id={} host='{}' -> '{}' port={}",
+                    log_ctx, node_id, original_host, rewritten_host, rewritten_port
+                );
+            }
+        }
+        ResponseKind::Produce(produce) => {
+            let ids: Vec<i32> = produce.node_endpoints.iter().map(|e| e.node_id.0).collect();
+            update_port_offset_assignments(advertise_mode, &ids, false, log_ctx)?;
+            for endpoint in &mut produce.node_endpoints {
+                let original_host = endpoint.host.as_str().to_string();
+                let node_id = endpoint.node_id.0;
+                let original_port = endpoint.port;
+                let (rewritten_host, rewritten_port, route_key) =
+                    advertised_target(advertise_mode, node_id, &original_host, log_ctx)?;
+                assert_unique_downstream_endpoint(
+                    &mut seen_downstream_endpoints,
+                    node_id,
+                    &rewritten_host,
+                    rewritten_port,
+                    log_ctx,
+                );
+                let upstream_addr = format!("{}:{}", original_host, original_port);
+                remember_discovered_routes(&mut discovered_routes, node_id, upstream_addr, route_key);
+                endpoint.host = rewritten_host.clone().into();
+                endpoint.port = rewritten_port;
+                rewritten_any = true;
+
+                info!(
+                    "{} rewrote Produce node_endpoint node_id={} host='{}' -> '{}' port={}",
+                    log_ctx, node_id, original_host, rewritten_host, rewritten_port
+                );
+            }
+        }
+        ResponseKind::ShareFetch(share_fetch) => {
+            let ids: Vec<i32> = share_fetch.node_endpoints.iter().map(|e| e.node_id.0).collect();
+            update_port_offset_assignments(advertise_mode, &ids, false, log_ctx)?;
+            for endpoint in &mut share_fetch.node_endpoints {
+                let original_host = endpoint.host.as_str().to_string();
+                let node_id = endpoint.node_id.0;
+                let original_port = endpoint.port;
+                let (rewritten_host, rewritten_port, route_key) =
+                    advertised_target(advertise_mode, node_id, &original_host, log_ctx)?;
+                assert_unique_downstream_endpoint(
+                    &mut seen_downstream_endpoints,
+                    node_id,
+                    &rewritten_host,
+                    rewritten_port,
+                    log_ctx,
+                );
+                let upstream_addr = format!("{}:{}", original_host, original_port);
+                remember_discovered_routes(&mut discovered_routes, node_id, upstream_addr, route_key);
+                endpoint.host = rewritten_host.clone().into();
+                endpoint.port = rewritten_port;
+                rewritten_any = true;
+
+                info!(
+                    "{} rewrote ShareFetch node_endpoint node_id={} host='{}' -> '{}' port={}",
+                    log_ctx, node_id, original_host, rewritten_host, rewritten_port
+                );
+            }
+        }
+        ResponseKind::ShareAcknowledge(share_acknowledge) => {
+            let ids: Vec<i32> = share_acknowledge
+                .node_endpoints
+                .iter()
+                .map(|e| e.node_id.0)
+                .collect();
+            update_port_offset_assignments(advertise_mode, &ids, false, log_ctx)?;
+            for endpoint in &mut share_acknowledge.node_endpoints {
+                let original_host = endpoint.host.as_str().to_string();
+                let node_id = endpoint.node_id.0;
+                let original_port = endpoint.port;
+                let (rewritten_host, rewritten_port, route_key) =
+                    advertised_target(advertise_mode, node_id, &original_host, log_ctx)?;
+                assert_unique_downstream_endpoint(
+                    &mut seen_downstream_endpoints,
+                    node_id,
+                    &rewritten_host,
+                    rewritten_port,
+                    log_ctx,
+                );
+                let upstream_addr = format!("{}:{}", original_host, original_port);
+                remember_discovered_routes(&mut discovered_routes, node_id, upstream_addr, route_key);
+                endpoint.host = rewritten_host.clone().into();
+                endpoint.port = rewritten_port;
+                rewritten_any = true;
+
+                info!(
+                    "{} rewrote ShareAcknowledge node_endpoint node_id={} host='{}' -> '{}' port={}",
+                    log_ctx, node_id, original_host, rewritten_host, rewritten_port
                 );
             }
         }

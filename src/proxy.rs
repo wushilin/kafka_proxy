@@ -3,7 +3,7 @@ use crate::hosts::HostsResolver;
 use crate::kafka_io::{
     copy_exact_n, read_frame_len, write_frame_len, write_kafka_frame,
 };
-use crate::rewrite::{maybe_rewrite_kafka_response, BrokerAdvertiseMode};
+use crate::rewrite::{maybe_rewrite_kafka_response, should_attempt_rewrite, BrokerAdvertiseMode};
 use crate::stats::ProxyStats;
 use crate::upstream::upstream_host;
 use anyhow::{anyhow, Context, Result};
@@ -54,6 +54,25 @@ fn short_id() -> String {
 
 fn parse_broker_route_key(key: &str) -> Option<i32> {
     key.strip_prefix('b')?.parse::<i32>().ok()
+}
+
+fn remove_owned_route_keys(
+    routes: &mut HashMap<String, String>,
+    route_owners: &mut HashMap<String, i32>,
+    broker_id: i32,
+    keep_keys: Option<&HashSet<String>>,
+) {
+    let owned_keys: Vec<String> = route_owners
+        .iter()
+        .filter(|(key, owner_id)| {
+            **owner_id == broker_id && keep_keys.is_none_or(|keep| !keep.contains(*key))
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in owned_keys {
+        route_owners.remove(&key);
+        routes.remove(&key);
+    }
 }
 
 fn format_topology_map(map: &HashMap<i32, String>) -> String {
@@ -1150,6 +1169,7 @@ async fn forward_upstream_to_client<R, W>(
     client_write: &mut W,
     in_flight: Arc<Mutex<HashMap<i32, (ApiKey, i16)>>>,
     upstream_routes: Arc<Mutex<HashMap<String, String>>>,
+    upstream_route_owners: Arc<Mutex<HashMap<String, i32>>>,
     advertise_mode: Arc<BrokerAdvertiseMode>,
     listener_spawner: Option<Arc<ListenerSpawner>>,
     client_addr: SocketAddr,
@@ -1161,9 +1181,9 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut scratch = vec![0u8; 1024];
-    let mut rewrite_frame = vec![0u8; 1024];
+    let mut rewrite_frame = BytesMut::with_capacity(1024);
     ProxyStats::update_max(&stats.max_u2c_buffer, scratch.len());
-    ProxyStats::update_max(&stats.max_rewrite_buffer, rewrite_frame.len());
+    ProxyStats::update_max(&stats.max_rewrite_buffer, rewrite_frame.capacity());
 
     loop {
         let Some(frame_len) = read_frame_len(upstream_read).await? else {
@@ -1195,27 +1215,30 @@ where
             };
 
             if let Some((api_key, api_version)) = request_info {
-                let should_rewrite = matches!(
-                    api_key,
-                    ApiKey::Metadata | ApiKey::FindCoordinator | ApiKey::DescribeCluster
-                );
+                let should_rewrite = should_attempt_rewrite(api_key, api_version);
 
                 if should_rewrite {
-                    ensure_buffer_capacity(
-                        &mut rewrite_frame,
-                        frame_len,
-                        "upstream -> client",
-                        conn_ctx,
-                    );
-                    ProxyStats::update_max(&stats.max_rewrite_buffer, rewrite_frame.len());
+                    if frame_len > rewrite_frame.capacity() {
+                        info!(
+                            "{} increasing {} buffer from {} to {} on demand.",
+                            conn_ctx,
+                            "upstream -> client",
+                            rewrite_frame.capacity(),
+                            frame_len
+                        );
+                        rewrite_frame.reserve(frame_len - rewrite_frame.capacity());
+                    }
+                    rewrite_frame.resize(frame_len, 0);
+                    ProxyStats::update_max(&stats.max_rewrite_buffer, rewrite_frame.capacity());
                     rewrite_frame[..4].copy_from_slice(&corr_buf);
                     upstream_read
                         .read_exact(&mut rewrite_frame[4..frame_len])
                         .await
                         .context("Failed to read full rewritable response payload")?;
+                    let frame_bytes = rewrite_frame.split_to(frame_len).freeze();
 
                     match maybe_rewrite_kafka_response(
-                        &rewrite_frame[..frame_len],
+                        &frame_bytes,
                         api_key,
                         api_version,
                         advertise_mode.as_ref(),
@@ -1232,10 +1255,10 @@ where
                                     snapshot_set.insert(*id);
                                 }
                                 let mut snapshot_topology: HashMap<i32, String> = HashMap::new();
-                                for (route_key, addr) in &outcome.discovered_routes {
-                                    if let Some(id) = parse_broker_route_key(route_key) {
+                                for route in &outcome.discovered_routes {
+                                    if let Some(id) = parse_broker_route_key(&route.key) {
                                         if snapshot_set.contains(&id) {
-                                            snapshot_topology.insert(id, addr.clone());
+                                            snapshot_topology.insert(id, route.upstream_addr.clone());
                                         }
                                     }
                                 }
@@ -1263,7 +1286,7 @@ where
                                     let route_keys: Vec<String> = outcome
                                         .discovered_routes
                                         .iter()
-                                        .map(|(k, _)| k.clone())
+                                        .map(|route| route.key.clone())
                                         .collect();
                                     spawner
                                         .ensure_listeners_for_route_keys(&route_keys)
@@ -1307,7 +1330,7 @@ where
                                     let route_keys: Vec<String> = outcome
                                         .discovered_routes
                                         .iter()
-                                        .map(|(k, _)| k.clone())
+                                        .map(|route| route.key.clone())
                                         .collect();
                                     spawner
                                         .ensure_listeners_for_route_keys(&route_keys)
@@ -1318,8 +1341,27 @@ where
 
                             if !outcome.discovered_routes.is_empty() || !removed_broker_ids.is_empty() {
                                 let mut routes = upstream_routes.lock().await;
-                                for (broker, addr) in &outcome.discovered_routes {
-                                    routes.insert(broker.clone(), addr.clone());
+                                let mut route_owners = upstream_route_owners.lock().await;
+
+                                let mut keep_keys_by_broker: HashMap<i32, HashSet<String>> = HashMap::new();
+                                for route in &outcome.discovered_routes {
+                                    keep_keys_by_broker
+                                        .entry(route.broker_id)
+                                        .or_default()
+                                        .insert(route.key.clone());
+                                }
+                                for (broker_id, keep_keys) in &keep_keys_by_broker {
+                                    remove_owned_route_keys(
+                                        &mut routes,
+                                        &mut route_owners,
+                                        *broker_id,
+                                        Some(keep_keys),
+                                    );
+                                }
+
+                                for route in &outcome.discovered_routes {
+                                    routes.insert(route.key.clone(), route.upstream_addr.clone());
+                                    route_owners.insert(route.key.clone(), route.broker_id);
                                 }
                                 if let BrokerAdvertiseMode::PortOffset {
                                     hostname,
@@ -1329,14 +1371,23 @@ where
                                 } = advertise_mode.as_ref()
                                 {
                                     let broker_start = base_port.saturating_add(*bootstrap_reserved);
-                                    for broker_id in removed_broker_ids {
+                                    for broker_id in &removed_broker_ids {
+                                        remove_owned_route_keys(
+                                            &mut routes,
+                                            &mut route_owners,
+                                            *broker_id,
+                                            None,
+                                        );
                                         routes.remove(&format!("b{}", broker_id));
-                                        if let Ok(id_u16) = u16::try_from(broker_id) {
-                                            routes.remove(&format!(
+                                        route_owners.remove(&format!("b{}", broker_id));
+                                        if let Ok(id_u16) = u16::try_from(*broker_id) {
+                                            let key = format!(
                                                 "{}:{}",
                                                 hostname,
                                                 broker_start.saturating_add(id_u16)
-                                            ));
+                                            );
+                                            routes.remove(&key);
+                                            route_owners.remove(&key);
                                         }
                                     }
                                 }
@@ -1360,7 +1411,7 @@ where
                                     correlation_id,
                                     frame_len
                                 );
-                                Some(Bytes::copy_from_slice(&rewrite_frame[..frame_len]))
+                                Some(frame_bytes)
                             }
                         }
                         Err(e) => {
@@ -1470,6 +1521,7 @@ async fn proxy_connection(
     advertise_mode: Arc<BrokerAdvertiseMode>,
     listener_spawner: Option<Arc<ListenerSpawner>>,
     upstream_routes: Arc<Mutex<HashMap<String, String>>>,
+    upstream_route_owners: Arc<Mutex<HashMap<String, i32>>>,
     default_upstream: Arc<String>,
     client_addr: SocketAddr,
     stats: Arc<ProxyStats>,
@@ -1674,6 +1726,7 @@ async fn proxy_connection(
         advertise_mode,
         listener_spawner,
         upstream_routes,
+        upstream_route_owners,
         client_addr,
         conn_ctx,
         stats,
@@ -1701,6 +1754,7 @@ async fn run_proxy_data_plane(
     advertise_mode: Arc<BrokerAdvertiseMode>,
     listener_spawner: Option<Arc<ListenerSpawner>>,
     upstream_routes: Arc<Mutex<HashMap<String, String>>>,
+    upstream_route_owners: Arc<Mutex<HashMap<String, i32>>>,
     client_addr: SocketAddr,
     conn_ctx: String,
     stats: Arc<ProxyStats>,
@@ -1802,6 +1856,7 @@ async fn run_proxy_data_plane(
         &mut client_write,
         in_flight,
         upstream_routes,
+        upstream_route_owners,
         advertise_mode,
         listener_spawner,
         client_addr,
@@ -1967,6 +2022,7 @@ pub async fn serve(
     upstream_sasl_mechanism: Option<Arc<String>>,
     advertise_mode: Arc<BrokerAdvertiseMode>,
     upstream_routes: Arc<Mutex<HashMap<String, String>>>,
+    upstream_route_owners: Arc<Mutex<HashMap<String, i32>>>,
     default_upstream: Arc<String>,
     stats: Arc<ProxyStats>,
 ) -> Result<()> {
@@ -1982,6 +2038,7 @@ pub async fn serve(
             upstream_sasl_mechanism.clone(),
             advertise_mode.clone(),
             upstream_routes.clone(),
+            upstream_route_owners.clone(),
             default_upstream.clone(),
             stats.clone(),
         )))
@@ -2000,6 +2057,7 @@ pub async fn serve(
         let advertise_mode = advertise_mode.clone();
         let listener_spawner = listener_spawner.clone();
         let upstream_routes = upstream_routes.clone();
+        let upstream_route_owners = upstream_route_owners.clone();
         let default_upstream = default_upstream.clone();
         let stats = stats.clone();
 
@@ -2014,6 +2072,7 @@ pub async fn serve(
             advertise_mode,
             listener_spawner,
             upstream_routes,
+            upstream_route_owners,
             default_upstream,
             stats,
             None,
@@ -2074,6 +2133,7 @@ struct ListenerSpawner {
     upstream_sasl_mechanism: Option<Arc<String>>,
     advertise_mode: Arc<BrokerAdvertiseMode>,
     upstream_routes: Arc<Mutex<HashMap<String, String>>>,
+    upstream_route_owners: Arc<Mutex<HashMap<String, i32>>>,
     default_upstream: Arc<String>,
     stats: Arc<ProxyStats>,
     active_ports: Arc<Mutex<HashMap<u16, oneshot::Sender<()>>>>,
@@ -2090,6 +2150,7 @@ impl ListenerSpawner {
         upstream_sasl_mechanism: Option<Arc<String>>,
         advertise_mode: Arc<BrokerAdvertiseMode>,
         upstream_routes: Arc<Mutex<HashMap<String, String>>>,
+        upstream_route_owners: Arc<Mutex<HashMap<String, i32>>>,
         default_upstream: Arc<String>,
         stats: Arc<ProxyStats>,
     ) -> Self {
@@ -2103,6 +2164,7 @@ impl ListenerSpawner {
             upstream_sasl_mechanism,
             advertise_mode,
             upstream_routes,
+            upstream_route_owners,
             default_upstream,
             stats,
             active_ports: Arc::new(Mutex::new(HashMap::new())),
@@ -2193,6 +2255,7 @@ impl ListenerSpawner {
             let advertise_mode = self.advertise_mode.clone();
             let listener_spawner = Some(Arc::new(self.clone()));
             let upstream_routes = self.upstream_routes.clone();
+            let upstream_route_owners = self.upstream_route_owners.clone();
             let default_upstream = self.default_upstream.clone();
             let stats = self.stats.clone();
             let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -2213,6 +2276,7 @@ impl ListenerSpawner {
                 advertise_mode,
                 listener_spawner,
                 upstream_routes,
+                upstream_route_owners,
                 default_upstream,
                 stats,
                 Some(shutdown_rx),
@@ -2300,6 +2364,7 @@ fn spawn_accept_loop(
     advertise_mode: Arc<BrokerAdvertiseMode>,
     listener_spawner: Option<Arc<ListenerSpawner>>,
     upstream_routes: Arc<Mutex<HashMap<String, String>>>,
+    upstream_route_owners: Arc<Mutex<HashMap<String, i32>>>,
     default_upstream: Arc<String>,
     stats: Arc<ProxyStats>,
     shutdown_rx: Option<oneshot::Receiver<()>>,
@@ -2316,6 +2381,7 @@ fn spawn_accept_loop(
             advertise_mode,
             listener_spawner,
             upstream_routes,
+            upstream_route_owners,
             default_upstream,
             stats,
             shutdown_rx,
@@ -2335,6 +2401,7 @@ async fn run_accept_loop(
     advertise_mode: Arc<BrokerAdvertiseMode>,
     listener_spawner: Option<Arc<ListenerSpawner>>,
     upstream_routes: Arc<Mutex<HashMap<String, String>>>,
+    upstream_route_owners: Arc<Mutex<HashMap<String, i32>>>,
     default_upstream: Arc<String>,
     stats: Arc<ProxyStats>,
     mut shutdown_rx: Option<oneshot::Receiver<()>>,
@@ -2359,6 +2426,7 @@ async fn run_accept_loop(
                 let advertise_mode = advertise_mode.clone();
                 let listener_spawner = listener_spawner.clone();
                 let upstream_routes = upstream_routes.clone();
+                let upstream_route_owners = upstream_route_owners.clone();
                 let default_upstream = default_upstream.clone();
                 let stats = stats.clone();
 
@@ -2374,6 +2442,7 @@ async fn run_accept_loop(
                         advertise_mode,
                         listener_spawner,
                         upstream_routes,
+                        upstream_route_owners,
                         default_upstream,
                         addr,
                         stats,
