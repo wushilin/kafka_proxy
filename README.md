@@ -53,6 +53,10 @@ RssShmem:              0 kB
 The project is focused on simplicity and offer 2 modes. Botho modes are deterministic, safe and Load Balancer friendly out of the box!
 
 ### `sni`
+TLS SNI reads client's intended broker hostname, and intelligently learn which backend broker it is intended for.
+
+This mode uses only one listener per cluster, it is very cloud friendly!
+
 If you enable TLS to your client, you only need 1 port number!
 
 Best when you want one listener port and hostname-based routing.
