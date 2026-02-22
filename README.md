@@ -47,9 +47,17 @@ RssShmem:              0 kB
 - Supports downstream: `PLAINTEXT`, `SASL_PLAINTEXT`, `SSL`, `SASL_SSL`.
 - Supports upstream: `PLAINTEXT`, `SASL_PLAINTEXT`, `SSL`, `SASL_SSL`.
 - Optional auth swap between downstream identity and upstream SASL credentials.
+- Performance focused, almost Zero Memory Re-allocation, almost Zero Copy
+- Supports custom DNS resolution out of the box, you do not need to configure your private hosted zone in your cloud!
+  
+## Proxy to Backend Broker Mapping Modes
+The project is focused on simplicity and offer 2 modes. Botho modes are deterministic, safe and Load Balancer friendly out of the box!
 
-## Mapping Modes
 ### `sni`
+TLS SNI reads client's intended broker hostname, and intelligently learn which backend broker it is intended for.
+
+This mode uses only one listener per cluster, it is very cloud friendly!
+
 If you enable TLS to your client, you only need 1 port number!
 
 Best when you want one listener port and hostname-based routing.
@@ -71,9 +79,12 @@ Best when you want deterministic routing by port and support plaintext clients e
 
 - Uses a fixed downstream hostname and deterministic port mapping.
 - Deterministic formula:
-  - bootstrap reserved range: `base..base+19`
-  - broker listener port: `base + 20 + broker_id`
-- `base..base+19` routes to the first upstream bootstrap servers (up to 20 entries).
+  - base port maps to first bootstrap server (in your upsream bootstrap list)
+  - base port + 1 maps to second bootstrap server (in your upstream bootstrap list, not used if you do not have this second bootstrap server)
+  - ...
+  - base port + 19 maps to the 20th bootstrap server (in your upstream bootstrap list, not used if you do not have this 20th bootstrap server)
+  - Therefore, the ports reserved for bootstrap servers ranges in `base..base+19`
+  - broker listener port: `base + 20 + broker_id` (broker_id 0 is port base + 20, broker_id 4 is port base + 24). All these ports must be free and bindable. Otherwise program will fail and exit.
 - Safety guardrails:
   - `max_broker_id` bounds accepted broker ids.
   - Endpoint collisions and out-of-range computed ports are treated as errors.
