@@ -49,6 +49,51 @@ RssShmem:              0 kB
 - Optional auth swap between downstream identity and upstream SASL credentials.
 - Performance focused, almost Zero Memory Re-allocation, almost Zero Copy
 - Supports custom DNS resolution out of the box, you do not need to configure your private hosted zone in your cloud!
+
+## Kafka Protocol Compatibility Matrix
+
+Source of truth:
+- `kafka-protocol = 0.17.x` (generated from Kafka protocol schema `4.1.0`).
+- Proxy behavior in `src/proxy.rs` and `src/rewrite.rs`.
+
+Interpretation:
+- Most traffic is frame passthrough, so client and server negotiate directly.
+- Version constraints only apply on APIs we actively decode/encode (auth bootstrap + rewrite path).
+
+| Scope | API | Supported version range in proxy |
+|---|---|---|
+| Base protocol schema | Broker protocol generation target | Kafka `4.1.0` |
+| Passthrough data path (default) | All APIs not parsed/re-written by proxy | Opaque passthrough (proxy does not enforce per-API versions) |
+| Downstream auth bootstrap (`auth_swap`) | `SaslHandshake` | `0..1` |
+| Downstream auth bootstrap (`auth_swap`) | `SaslAuthenticate` | `0..2` |
+| Downstream auth bootstrap (`auth_swap`) | `ApiVersions` | `0..4` passthrough during bootstrap |
+| Upstream auth bootstrap (`auth_swap`) | `SaslHandshake` | Proxy sends v`1` |
+| Upstream auth bootstrap (`auth_swap`) | `SaslAuthenticate` | Proxy sends v`1` |
+| Rewrite path | `Metadata` response | `0..13` |
+| Rewrite path | `FindCoordinator` response | `0..6` |
+| Rewrite path | `DescribeCluster` response | `0..2` |
+| Rewrite path | `Fetch` response (`node_endpoints` only) | `4..18` (rewrite of `node_endpoints` applies to v`16+`) |
+| Rewrite path | `Produce` response (`node_endpoints` only) | `3..13` (rewrite of `node_endpoints` applies to v`10+`) |
+| Rewrite path | `ShareFetch` response (`node_endpoints`) | `1` |
+| Rewrite path | `ShareAcknowledge` response (`node_endpoints`) | `1` |
+
+Practical guidance:
+- If you run the proxy as a pure tunnel (no `auth_swap`, no rewrite-relevant APIs), client/broker compatibility is unchanged.
+- If you use `auth_swap` and/or response rewriting, keep clients/brokers within the ranges above.
+
+### Unknown API Key / Version Behavior
+
+| Path | Condition | Proxy behavior |
+|---|---|---|
+| Normal client->upstream forwarding | Unknown request API key | Forward request bytes unchanged, log warning, skip rewrite tracking for that correlation id |
+| Normal upstream->client forwarding | Response correlation id not tracked (including unknown API key request case) | Forward response bytes unchanged |
+| Rewrite path | API key not in rewrite set | No decode/rewrite; response forwarded unchanged |
+| Rewrite path | API version outside supported rewrite range | Log `skipping rewrite for unsupported API version`, response forwarded unchanged |
+| `auth_swap` bootstrap request parsing | Unknown request API key while waiting for `SaslHandshake`/`SaslAuthenticate`/`ApiVersions` | Connection fails for that bootstrap flow (request parsing rejects unknown key) |
+
+Notes:
+- Unknown/unsupported keys and versions are generally safe in passthrough mode.
+- Strict behavior is only during `auth_swap` bootstrap, where the proxy must parse specific SASL APIs.
   
 ## Proxy to Backend Broker Mapping Modes
 The project is focused on simplicity and offer 2 modes. Botho modes are deterministic, safe and Load Balancer friendly out of the box!

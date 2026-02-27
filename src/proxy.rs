@@ -48,6 +48,39 @@ fn ensure_buffer_capacity(buf: &mut Vec<u8>, needed: usize, label: &str, conn_ct
     }
 }
 
+/// Ring buffer of the last N Fetch response sizes, used to decide when to shrink the rewrite buffer.
+struct FetchSizeRing {
+    buf: [usize; 10],
+    len: usize,
+    pos: usize,
+}
+
+impl FetchSizeRing {
+    fn new() -> Self {
+        Self {
+            buf: [0; 10],
+            len: 0,
+            pos: 0,
+        }
+    }
+
+    fn push(&mut self, v: usize) {
+        self.buf[self.pos] = v;
+        self.pos = (self.pos + 1) % 10;
+        if self.len < 10 {
+            self.len += 1;
+        }
+    }
+
+    fn max(&self) -> usize {
+        if self.len == 0 {
+            0
+        } else {
+            self.buf[..self.len].iter().copied().max().unwrap_or(0)
+        }
+    }
+}
+
 fn short_id() -> String {
     Uuid::new_v4().simple().to_string()[..8].to_string()
 }
@@ -250,6 +283,8 @@ where
     }
     let api_key_raw = i16::from_be_bytes([payload[0], payload[1]]);
     let api_version = i16::from_be_bytes([payload[2], payload[3]]);
+    // Auth-swap bootstrap parses/handles only known Kafka APIs (Sasl*/ApiVersions);
+    // unknown API keys are rejected here instead of passthrough.
     let api_key =
         ApiKey::try_from(api_key_raw).map_err(|_| anyhow!("Unknown request API key {}", api_key_raw))?;
 
@@ -1128,7 +1163,7 @@ where
                 }
                 Err(_) => {
                     warn!(
-                        "Client {} sent request with unknown API key {}",
+                        "Client {} sent request with unknown API key {}; forwarding request as passthrough (no rewrite tracking for this correlation id)",
                         client_addr, api_key_raw
                     );
                 }
@@ -1182,6 +1217,7 @@ where
 {
     let mut scratch = vec![0u8; 1024];
     let mut rewrite_frame = BytesMut::with_capacity(1024);
+    let mut fetch_size_ring = FetchSizeRing::new();
     ProxyStats::update_max(&stats.max_u2c_buffer, scratch.len());
     ProxyStats::update_max(&stats.max_rewrite_buffer, rewrite_frame.capacity());
 
@@ -1427,7 +1463,11 @@ where
                         }
                     };
                     if matches!(api_key, ApiKey::Fetch) {
-                        rewrite_frame = BytesMut::with_capacity(1024);
+                        fetch_size_ring.push(frame_len as usize);
+                        let target = (fetch_size_ring.max() * 2).max(64 * 1024);
+                        if target <= rewrite_frame.capacity() / 2 {
+                            rewrite_frame = BytesMut::with_capacity(target);
+                        }
                     }
                     rewritten_payload
                 } else {
